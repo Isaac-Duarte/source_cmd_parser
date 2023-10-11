@@ -23,7 +23,7 @@ async fn main() -> SourceCmdResult<()> {
         .file_path(Box::new(PathBuf::from(
             "PATH_OF_LOG_FILE",
         )))
-        .ping(".ping", pong)
+        .add_command(".ping", pong)
         .owner("USER_NAME") // This is required as it will put an input delay if you type the question.
         .build()?;
 
