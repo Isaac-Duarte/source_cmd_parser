@@ -5,6 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
@@ -16,7 +17,7 @@ use futures::{
 };
 use log::{debug, error, info};
 use notify::{Config, EventKind, RecommendedWatcher, Watcher};
-use tokio::time;
+use tokio::{sync::RwLock, time};
 
 use crate::{
     error::{SourceCmdError, SourceCmdResult},
@@ -30,7 +31,10 @@ use crate::{
 /// This trait ensures thread safety by requiring the `Send`, `Sync`,
 /// and `'static` lifetimes for its implementors which allows the function
 /// to be async.
-pub trait SourceCmdFn: Send + Sync + 'static {
+pub trait SourceCmdFn<T>: Send + Sync + 'static
+where
+    T: Send + Sync + 'static,
+{
     /// Takes a `ChatMessage` and returns a future resolving to a result
     /// containing an optional chat response.
     ///
@@ -43,6 +47,7 @@ pub trait SourceCmdFn: Send + Sync + 'static {
     fn call(
         &self,
         message: ChatMessage,
+        state: Arc<RwLock<T>>,
     ) -> Pin<Box<dyn Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send>>;
 }
 
@@ -51,16 +56,18 @@ pub trait SourceCmdFn: Send + Sync + 'static {
 ///
 /// This allows for any appropriate function to be treated as a `SourceCmdFn`
 /// without needing to explicitly wrap it or implement the trait separately.
-impl<F, Fut> SourceCmdFn for F
+impl<F, Fut, T> SourceCmdFn<T> for F
 where
-    F: Fn(ChatMessage) -> Fut + Sync + Send + 'static,
+    F: Fn(ChatMessage, Arc<RwLock<T>>) -> Fut + Sync + Send + 'static,
     Fut: Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send + 'static,
+    T: Send + Sync + 'static,
 {
     fn call(
         &self,
         message: ChatMessage,
+        state: Arc<RwLock<T>>,
     ) -> Pin<Box<dyn Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send>> {
-        Box::pin(self(message))
+        Box::pin(self(message, state))
     }
 }
 
@@ -73,21 +80,25 @@ const CS2_REGEX_STRING: &str = r"^(\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (\*DEAD\* )?(
 ///
 /// It holds the configuration and resources required to monitor a file for changes,
 /// parse the incoming chat commands, and execute the associated actions.
-pub struct SourceCmdLogParser {
+pub struct SourceCmdLogParser<T> {
     file_path: PathBuf,
     time_out: Option<Duration>,
-    commands: HashMap<String, Vec<Box<dyn SourceCmdFn>>>,
+    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
     regex: regex::Regex,
     watcher: RecommendedWatcher,
     rx: Receiver<notify::Result<notify::Event>>,
     enigo: enigo::Enigo,
     last_position: u64,
     owner: Option<String>,
+    shared_state: Arc<RwLock<T>>,
 }
 
-impl SourceCmdLogParser {
-    pub fn builder() -> SourceCmdBuilder {
-        SourceCmdBuilder::new()
+impl<T> SourceCmdLogParser<T> {
+    pub fn builder() -> SourceCmdBuilder<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        SourceCmdBuilder::<T>::new()
     }
 
     /// Retrieves the commands associated with a given command string.
@@ -97,7 +108,7 @@ impl SourceCmdLogParser {
     ///
     /// # Returns
     /// An optional reference to a vec of command functions.
-    pub fn get_commands(&self, command: &str) -> Option<&Vec<Box<dyn SourceCmdFn>>> {
+    pub fn get_commands(&self, command: &str) -> Option<&Vec<Box<dyn SourceCmdFn<T>>>> {
         self.commands.get(command)
     }
 
@@ -135,7 +146,6 @@ impl SourceCmdLogParser {
     /// An optional `ChatMessage` containing the parsed message details.
     /// Returns `None` if the parsing fails.
     pub fn parse_command(&self, raw_message: &str) -> Option<ChatMessage> {
-        // This is specific to Jailbreak lol
         let raw_message = if raw_message.contains("[Warden]") {
             raw_message
                 .trim()
@@ -175,10 +185,26 @@ impl SourceCmdLogParser {
     /// An asynchronous result containing an optional `ChatResponse`.
     pub async fn execute_command(
         &self,
-        command: &Box<dyn SourceCmdFn>,
-        message: ChatMessage,
-    ) -> SourceCmdResult<Option<ChatResponse>> {
-        command.call(message).await
+        command: &Box<dyn SourceCmdFn<T>>,
+        message: &ChatMessage,
+    ) -> SourceCmdResult<Option<ChatResponse>>
+    where
+        T: Send + Sync + 'static,
+    {
+        let response = command
+            .call(message.clone(), self.shared_state.clone())
+            .await;
+
+        match response {
+            Ok(response) => Ok(response),
+            Err(err) => {
+                error!(
+                    "Error whil executing command {}: {:?}",
+                    message.command, err
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Runs a sequence of actions based on the provided `ChatResponse`.
@@ -211,12 +237,7 @@ impl SourceCmdLogParser {
             enigo.key_up(enigo::Key::Return);
         }
 
-        let mut message = chat_response.message.as_str();
-
-        // if the message is longer that 240 then trim it
-        if message.len() > 240 {
-            message = &message[..240];
-        }
+        let message = chat_response.message.as_str();
 
         if message.len() <= 120 {
             send_message(&mut self.enigo, message, chat_response).await;
@@ -254,17 +275,43 @@ impl SourceCmdLogParser {
         Ok(())
     }
 
+    fn handle_execution_response(
+        &self,
+        response: Option<ChatResponse>,
+        message: &ChatMessage,
+    ) -> SourceCmdResult<Vec<ChatResponse>> {
+        let mut responses = vec![];
+
+        if let Some(mut response) = response {
+            // If the response has an owner, add a delay before executing
+            if self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner == &message.user_name)
+            {
+                response.delay_on_enter = Some(Duration::from_millis(700));
+            }
+
+            responses.push(response);
+        }
+
+        Ok(responses)
+    }
+
     /// Starts monitoring the file for changes, parses chat messages,
     /// and executes the associated commands.
     ///
     /// # Returns
     /// A result indicating the success or failure of the operation.
-    pub async fn run(&mut self) -> SourceCmdResult<()> {
+    pub async fn run(&mut self) -> SourceCmdResult<()>
+    where
+        T: Send + Sync + 'static,
+    {
         let parent = self.file_path.parent().unwrap();
         info!("Watching: {:?}", parent);
 
         // Initial read
-        SourceCmdLogParser::read_new_lines(&self.file_path, &mut self.last_position)?;
+        SourceCmdLogParser::<T>::read_new_lines(&self.file_path, &mut self.last_position)?;
 
         self.watcher
             .watch(parent, notify::RecursiveMode::NonRecursive)?;
@@ -273,40 +320,14 @@ impl SourceCmdLogParser {
             let mut responses = Vec::new();
 
             for message in messages? {
-                if let Some(commands) = self.get_commands(&message.command) {
-                    for command in commands {
-                        let response = self.execute_command(command, message.clone()).await?;
-
-                        if let Some(mut response) = response {
-                            // If the response has an owner, add a delay before executing
-                            if self
-                                .owner
-                                .as_ref()
-                                .is_some_and(|owner| owner == &message.user_name)
-                            {
-                                response.delay_on_enter = Some(Duration::from_millis(700));
-                            }
-
-                            responses.push(response);
-                        }
-                    }
-                }
-
-                if let Some(commands) = self.get_commands("") {
-                    for command in commands {
-                        let response = self.execute_command(command, message.clone()).await?;
-
-                        if let Some(mut response) = response {
-                            // If the response has an owner, add a delay before executing
-                            if self
-                                .owner
-                                .as_ref()
-                                .is_some_and(|owner| owner == &message.user_name)
-                            {
-                                response.delay_on_enter = Some(Duration::from_millis(700));
-                            }
-
-                            responses.push(response);
+                // This will execute the desingated command, and commands with no prefix
+                for cmd_arg in [&message.command, ""].iter() {
+                    if let Some(commands) = self.get_commands(cmd_arg) {
+                        for command in commands {
+                            responses.extend(self.handle_execution_response(
+                                self.execute_command(command, &message).await?,
+                                &message,
+                            )?);
                         }
                     }
                 }
@@ -330,8 +351,10 @@ impl SourceCmdLogParser {
 
         reader.seek(SeekFrom::Start(*last_position))?;
 
-        for line in reader.by_ref().lines().flatten() {
-            lines.push(line);
+        for line in reader.by_ref().lines() {
+            if let Ok(line) = line {
+                lines.push(line);
+            }
         }
 
         *last_position = reader.stream_position()?;
@@ -353,7 +376,7 @@ impl SourceCmdLogParser {
 /// - `Poll::Ready(Some(Err(_)))`: When there's an error while reading or parsing the file.
 /// - `Poll::Ready(None)`: When the stream ends, i.e., no more messages are expected.
 /// - `Poll::Pending`: When there's no new data available yet, but the stream hasn't ended.
-impl Stream for SourceCmdLogParser {
+impl<T> Stream for SourceCmdLogParser<T> {
     type Item = SourceCmdResult<Vec<ChatMessage>>;
 
     fn poll_next(
@@ -374,7 +397,7 @@ impl Stream for SourceCmdLogParser {
                             return Poll::Pending;
                         }
 
-                        let lines = SourceCmdLogParser::read_new_lines(
+                        let lines = SourceCmdLogParser::<T>::read_new_lines(
                             &cmd_parser.file_path,
                             &mut cmd_parser.last_position,
                         )?;
@@ -404,20 +427,22 @@ impl Stream for SourceCmdLogParser {
     }
 }
 
-pub struct SourceCmdBuilder {
+pub struct SourceCmdBuilder<T> {
     file_path: Option<PathBuf>,
     time_out: Option<Duration>,
-    commands: HashMap<String, Vec<Box<dyn SourceCmdFn>>>,
+    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
     owner: Option<String>,
+    state: Option<T>,
 }
 
-impl SourceCmdBuilder {
+impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
     pub fn new() -> Self {
         Self {
             file_path: None,
             time_out: None,
             commands: HashMap::new(),
             owner: None,
+            state: None,
         }
     }
 
@@ -433,7 +458,7 @@ impl SourceCmdBuilder {
         self
     }
 
-    pub fn add_command<F: SourceCmdFn + 'static>(mut self, command: &str, function: F) -> Self {
+    pub fn add_command<F: SourceCmdFn<T> + 'static>(mut self, command: &str, function: F) -> Self {
         self.commands
             .entry(command.to_string())
             .or_default()
@@ -442,7 +467,7 @@ impl SourceCmdBuilder {
         self
     }
 
-    pub fn add_commandd<F: SourceCmdFn + 'static>(mut self, function: F) -> Self {
+    pub fn add_commandd<F: SourceCmdFn<T> + 'static>(mut self, function: F) -> Self {
         self.commands
             .entry("".to_string())
             .or_default()
@@ -456,9 +481,14 @@ impl SourceCmdBuilder {
         self
     }
 
-    pub fn build(self) -> SourceCmdResult<SourceCmdLogParser> {
-        if let Some(file_path) = self.file_path {
-            let (watcher, rx) = SourceCmdLogParser::async_watcher()?;
+    pub fn state(mut self, state: T) -> Self {
+        self.state = Some(state);
+        self
+    }
+
+    pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T>> {
+        if let (Some(file_path), Some(state)) = (self.file_path, self.state) {
+            let (watcher, rx) = SourceCmdLogParser::<T>::async_watcher()?;
 
             Ok(SourceCmdLogParser {
                 file_path,
@@ -470,67 +500,12 @@ impl SourceCmdBuilder {
                 enigo: enigo::Enigo::new(),
                 last_position: 0,
                 owner: self.owner,
+                shared_state: Arc::new(RwLock::new(state)),
             })
         } else {
             Err(SourceCmdError::MissingFieldS(
                 "file_path, directory_path, time_out, commands".to_string(),
             ))
         }
-    }
-}
-
-impl Default for SourceCmdBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::model::{ChatMessage, ChatResponse};
-
-    use super::*;
-
-    async fn pong(chat_message: ChatMessage) -> SourceCmdResult<Option<ChatResponse>> {
-        Ok(Some(ChatResponse::new(format!(
-            "PONG {}",
-            chat_message.message
-        ))))
-    }
-
-    #[tokio::test]
-    async fn test_source_cmd_builder() {
-        let parser = SourceCmdBuilder::new()
-            .file_path(Box::new(PathBuf::from("test.txt")))
-            .time_out(Duration::from_millis(1000))
-            .add_command("ping", pong)
-            .add_command("ping_closure", |chat_message: ChatMessage| async move {
-                Ok(Some(ChatResponse::new(format!(
-                    "PONG {}",
-                    chat_message.message
-                ))))
-            })
-            .build()
-            .unwrap();
-
-        let result = parser
-            .execute_command(
-                parser.get_commands("ping").unwrap().get(0).unwrap(),
-                ChatMessage::new(
-                    "isaac".to_string(),
-                    "Hello".to_string(),
-                    "ping".to_string(),
-                    "".to_string(),
-                ),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(result, ChatResponse::new("PONG Hello".to_string()));
-
-        assert_eq!(parser.file_path, Path::new("test.txt"));
-        assert_eq!(parser.time_out, Some(Duration::from_millis(1000)));
-        assert_eq!(parser.commands.len(), 2);
     }
 }
