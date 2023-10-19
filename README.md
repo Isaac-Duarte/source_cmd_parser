@@ -42,5 +42,5 @@ There are many other examples including a math expression evaluator, and a ChatG
 ## Roadmap
 This is really just a fun side project, but I would like to implement the following.
 - [ ] Allow for custom error handling in commands (by expecting a error that implements a custom trait)
-- [ ] Mutable state for commands
+- [x] Mutable state for commands
 
