@@ -123,6 +123,7 @@ name = "chatgpt"
 version = "0.1.0"
 dependencies = [
  "chatgpt_rs",
+ "chrono",
  "lazy_static",
  "log",
  "pretty_env_logger",
