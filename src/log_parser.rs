@@ -393,14 +393,16 @@ impl<T> Stream for SourceCmdLogParser<T> {
                         if !EventKind::is_modify(&event.kind)
                             || event.paths[0] != cmd_parser.file_path
                         {
-                            cx.waker().wake_by_ref();
-                            return Poll::Pending;
+                            return Poll::Ready(Some(Ok(vec![])));
                         }
 
-                        let lines = SourceCmdLogParser::<T>::read_new_lines(
+                        let lines = match SourceCmdLogParser::<T>::read_new_lines(
                             &cmd_parser.file_path,
                             &mut cmd_parser.last_position,
-                        )?;
+                        ) {
+                            Ok(lines) => lines,
+                            Err(e) => return Poll::Ready(Some(Err(e))),
+                        };
 
                         let messages = lines
                             .iter()
@@ -411,21 +413,23 @@ impl<T> Stream for SourceCmdLogParser<T> {
                     }
                     Err(e) => {
                         error!("Error: {:?}", e);
-                        // Handle error
-                        Poll::Pending
+                        // You might want to handle this error more gracefully
+                        Poll::Ready(Some(Err(e.into())))
                     }
                 }
             }
             Poll::Ready(None) => {
-                Poll::Ready(None) // Stream ended
+                // Stream ended
+                Poll::Ready(None)
             }
             Poll::Pending => {
-                cx.waker().wake_by_ref();
+                // Just return Poll::Pending without waking up the task again
                 Poll::Pending
             }
         }
     }
 }
+
 
 pub struct SourceCmdBuilder<T> {
     file_path: Option<PathBuf>,
