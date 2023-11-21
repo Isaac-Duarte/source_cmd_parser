@@ -18,11 +18,12 @@ This is a ping pong example, if somebody types .ping, it will respond with Pong.
 
 ```rust
 #[tokio::main]
-async fn main() -> SourceCmdResult<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut parser = SourceCmdBuilder::new()
         .file_path(Box::new(PathBuf::from(
             "PATH_OF_LOG_FILE",
         )))
+        .set_parser(Box::new(CSSLogParser::new()))
         .add_command(".ping", pong)
         .owner("USER_NAME") // This is required as it will put an input delay if you type the question.
         .build()?;
@@ -32,7 +33,7 @@ async fn main() -> SourceCmdResult<()> {
     Ok(())
 }
 
-async fn pong(chat_message: ChatMessage) -> SourceCmdResult<Option<ChatResponse>> {
+async fn pong(chat_message: ChatMessage) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
     Ok(Some(ChatResponse::new("Pong".to_string())))
 }
 ```
