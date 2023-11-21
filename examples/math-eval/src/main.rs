@@ -1,10 +1,16 @@
-use std::{env, path::PathBuf, collections::HashMap, time::{Instant, Duration}, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use log::{info, LevelFilter, warn};
+use log::{info, warn, LevelFilter};
 use source_cmd_parser::{
-    error::SourceCmdResult,
     log_parser::SourceCmdBuilder,
     model::{ChatMessage, ChatResponse},
+    parsers::CSSLogParser,
 };
 use tokio::sync::RwLock;
 
@@ -20,7 +26,7 @@ pub struct UserCooldown {
 }
 
 #[tokio::main]
-async fn main() -> SourceCmdResult<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::formatted_timed_builder()
         .filter_level(LevelFilter::Debug)
         .init();
@@ -31,7 +37,8 @@ async fn main() -> SourceCmdResult<()> {
             "/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/log.txt",
         )))
         .state(State::default())
-        .add_commandd(eval)
+        .set_parser(Box::new(CSSLogParser::new()))
+        .add_global_command(eval)
         .owner("***REMOVED***")
         .build()?;
 
@@ -46,42 +53,40 @@ const MESSAGE_LIMIT: usize = 5;
 async fn eval(
     chat_message: ChatMessage,
     state_lock: Arc<RwLock<State>>,
-) -> SourceCmdResult<Option<ChatResponse>> {
+) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
     let message = chat_message.raw_message;
 
     if message.trim().parse::<f64>().is_ok() {
         return Ok(None);
     }
 
-    match meval::eval_str(&message.replace("x", "*")) {
+    match meval::eval_str(&message.replace('x', "*")) {
         Ok(response) => {
             {
                 let mut state = state_lock.write().await;
-        
+
                 let user_cooldown = state
                     .user_cooldowns
                     .entry(chat_message.user_name.clone())
                     .or_insert(UserCooldown {
                         timestamps: Vec::new(),
                     });
-        
-                
-        
+
                 // Remove outdated timestamps
                 user_cooldown
                     .timestamps
                     .retain(|&timestamp| timestamp.elapsed() < COOLDOWN_DURATION);
-        
+
                 // Check cooldown status
                 if user_cooldown.timestamps.len() >= MESSAGE_LIMIT {
                     warn!(
                         "Skipping eval. User {} has reached the message limit of {}. Time left till cooldown: {:?}",
                         chat_message.user_name, MESSAGE_LIMIT,
                         COOLDOWN_DURATION - user_cooldown.timestamps[0].elapsed());
-                        
+
                     return Ok(None);
                 }
-        
+
                 // If not in cooldown, add the new timestamp
                 user_cooldown.timestamps.push(Instant::now());
             }

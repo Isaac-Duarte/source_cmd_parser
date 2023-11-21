@@ -1,13 +1,13 @@
-use std::{env, path::PathBuf, sync::{Arc}};
+use std::{env, path::PathBuf, sync::Arc};
 
 use chatgpt::{prelude::ChatGPT, types::CompletionResponse};
 use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use log::{info, LevelFilter};
 use source_cmd_parser::{
-    error::SourceCmdResult,
     log_parser::SourceCmdBuilder,
     model::{ChatMessage, ChatResponse},
+    parsers::CSSLogParser,
 };
 use tokio::sync::RwLock;
 
@@ -26,7 +26,7 @@ pub struct State {
 }
 
 #[tokio::main]
-async fn main() -> SourceCmdResult<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::formatted_timed_builder()
         .filter_level(LevelFilter::Debug)
         .init();
@@ -37,6 +37,7 @@ async fn main() -> SourceCmdResult<()> {
             "/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/log.txt",
         )))
         .state(State::default())
+        .set_parser(Box::new(CSSLogParser::new()))
         .add_command(".explain", explain)
         .add_command(".dad_joke", dad_joke)
         .owner("***REMOVED***")
@@ -50,7 +51,7 @@ async fn main() -> SourceCmdResult<()> {
 async fn explain(
     chat_message: ChatMessage,
     state: Arc<RwLock<State>>,
-) -> SourceCmdResult<Option<ChatResponse>> {
+) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
     info!("Explain: {}", chat_message.message);
 
     {
@@ -84,10 +85,14 @@ async fn explain(
     Ok(Some(ChatResponse::new(chat_response)))
 }
 
-async fn dad_joke(_: ChatMessage, _: Arc<RwLock<State>>) -> SourceCmdResult<Option<ChatResponse>> {
+async fn dad_joke(
+    _: ChatMessage,
+    _: Arc<RwLock<State>>,
+) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
     let response: CompletionResponse = GPT_CLIENT
         .send_message("Please tell me a data joke".to_string())
-        .await.unwrap();
+        .await
+        .unwrap();
 
     let chat_response = response.message_choices[0].message.content.clone();
     Ok(Some(ChatResponse::new(chat_response)))
