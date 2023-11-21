@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     task::Poll,
     time::Duration,
 };
@@ -123,6 +123,9 @@ pub struct SourceCmdLogParser<T> {
     /// This is the delay between each chunk of a long message, or when
     /// the message is sent by the owner
     chat_delay: Duration,
+
+    /// This is the stop flag that will be used to stop the parser
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<T> SourceCmdLogParser<T> {
@@ -396,6 +399,13 @@ impl<T> Stream for SourceCmdLogParser<T> {
     ) -> std::task::Poll<Option<Self::Item>> {
         let cmd_parser = self.get_mut();
 
+        // Check if the stop flag is set
+        if let Some(stop_flag) = &cmd_parser.stop_flag {
+            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Poll::Ready(None);
+            }
+        }
+
         match Pin::new(&mut cmd_parser.rx).poll_next(cx) {
             Poll::Ready(Some(event_result)) => {
                 match event_result {
@@ -443,6 +453,7 @@ pub struct SourceCmdBuilder<T> {
     parse_log: Option<Box<dyn ParseLog>>,
     max_entry_length: usize,
     chat_delay: Duration,
+    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<T: Send + Sync + 'static> Default for SourceCmdBuilder<T> {
@@ -462,6 +473,7 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
             parse_log: None,
             max_entry_length: 128,
             chat_delay: Duration::from_millis(600),
+            stop_flag: None,
         }
     }
 
@@ -515,6 +527,11 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
+    pub fn stop_flag(mut self, stop_flag: Arc<AtomicBool>) -> Self {
+        self.stop_flag = Some(stop_flag);
+        self
+    }
+
     pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T>> {
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
@@ -540,6 +557,7 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
                 parse_log,
                 max_entry_length: self.max_entry_length,
                 chat_delay: self.chat_delay,
+                stop_flag: self.stop_flag,
             })
         } else {
             Err(SourceCmdError::MissingFieldS(
