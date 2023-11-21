@@ -24,6 +24,9 @@ use crate::{
     model::{ChatMessage, ChatResponse},
 };
 
+// Maybe change to trait? Not sure
+pub type SouceError = Box<dyn std::error::Error>;
+
 /// The `SourceCmdFn` trait provides a unified interface for functions
 /// that accept a chat message and asynchronously produce a result with
 /// an optional chat response.
@@ -48,7 +51,14 @@ where
         &self,
         message: ChatMessage,
         state: Arc<RwLock<T>>,
-    ) -> Pin<Box<dyn Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>>;
+}
+
+/// The `Parse` trait provides a unified interface for users of this library
+/// to implement their own chat message parsers. This is useful mainly
+/// when implmenting a parser for a different game.
+pub trait ParseLog {
+    fn parse_command(&self, message: &str) -> Option<ChatMessage>;
 }
 
 /// Implementation of `SourceCmdFn` for any function type `F` that meets
@@ -59,21 +69,17 @@ where
 impl<F, Fut, T> SourceCmdFn<T> for F
 where
     F: Fn(ChatMessage, Arc<RwLock<T>>) -> Fut + Sync + Send + 'static,
-    Fut: Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send + 'static,
+    Fut: Future<Output = Result<Option<ChatResponse>, SouceError>> + Send + 'static,
     T: Send + Sync + 'static,
 {
     fn call(
         &self,
         message: ChatMessage,
         state: Arc<RwLock<T>>,
-    ) -> Pin<Box<dyn Future<Output = SourceCmdResult<Option<ChatResponse>>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>> {
         Box::pin(self(message, state))
     }
 }
-
-const REGEX_STRING: &str =
-    r"^(\d{2}\/\d{2}\/\d{4} - \d{2}:\d{2}:\d{2}): (\*DEAD\* )?([^:]+) :  (.+)$";
-const CS2_REGEX_STRING: &str = r"^(\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (\*DEAD\* )?([^:]+) : (.+)$";
 
 /// `SourceCmdLogParser` is responsible for monitoring a file for changes,
 /// parsing chat messages, and executing associated commands.
@@ -81,16 +87,42 @@ const CS2_REGEX_STRING: &str = r"^(\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (\*DEAD\* )?(
 /// It holds the configuration and resources required to monitor a file for changes,
 /// parse the incoming chat commands, and execute the associated actions.
 pub struct SourceCmdLogParser<T> {
+    /// This is the path to the file that will be monitored
     file_path: PathBuf,
+
+    /// This is the timeout for commands
     time_out: Option<Duration>,
+
+    /// This is a map of commands to their associated functions
     commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
-    regex: regex::Regex,
+
+    /// This is the file watcher that will be used to monitor the file
     watcher: RecommendedWatcher,
+
+    /// This is the receiver for the file watcher
     rx: Receiver<notify::Result<notify::Event>>,
+
+    /// This is the enigo instance that will be used to send key presses
     enigo: enigo::Enigo,
+
+    /// This is the last position in the file that was read
     last_position: u64,
+
+    /// This is the user name of the owner of the commands
     owner: Option<String>,
+
+    /// This is the shared state that will be passed to the command functions
     shared_state: Arc<RwLock<T>>,
+
+    /// This is the parser that will be used to parse chat messages
+    parse_log: Box<dyn ParseLog>,
+
+    /// This is the max length of a chat message that will be sent in one chunk
+    max_entry_length: usize,
+
+    /// This is the delay between each chunk of a long message, or when
+    /// the message is sent by the owner
+    chat_delay: Duration,
 }
 
 impl<T> SourceCmdLogParser<T> {
@@ -137,44 +169,6 @@ impl<T> SourceCmdLogParser<T> {
         Ok((watcher, rx))
     }
 
-    /// Parses a raw message string into a `ChatMessage` struct.
-    ///
-    /// # Parameters
-    /// - `raw_message`: The raw string message to be parsed.
-    ///
-    /// # Returns
-    /// An optional `ChatMessage` containing the parsed message details.
-    /// Returns `None` if the parsing fails.
-    pub fn parse_command(&self, raw_message: &str) -> Option<ChatMessage> {
-        let raw_message = if raw_message.contains("[Warden]") {
-            raw_message
-                .trim()
-                .replace("[Warden]00BFFF ", "")
-                .replace("000000", "")
-                .replace("FFC0CB", " ")
-        } else {
-            raw_message.trim().to_string()
-        };
-
-        if let Some(captures) = self.regex.captures(&raw_message) {
-            let user_name = captures.get(3).unwrap().as_str().to_string();
-            let message = captures.get(4).unwrap().as_str().to_string();
-            let command = message.split_whitespace().next().unwrap().to_string();
-            let raw_message = message.clone();
-
-            let message = if message.starts_with(command.as_str()) {
-                message[command.len()..].trim().to_string()
-            } else {
-                message
-            };
-
-            Some(ChatMessage::new(user_name, message, command, raw_message))
-        } else {
-            debug!("Failed to parse message: {}", raw_message);
-            None
-        }
-    }
-
     /// Executes a given chat command asynchronously.
     ///
     /// # Parameters
@@ -185,15 +179,32 @@ impl<T> SourceCmdLogParser<T> {
     /// An asynchronous result containing an optional `ChatResponse`.
     pub async fn execute_command(
         &self,
-        command: &Box<dyn SourceCmdFn<T>>,
+        command: &dyn SourceCmdFn<T>,
         message: &ChatMessage,
     ) -> SourceCmdResult<Option<ChatResponse>>
     where
         T: Send + Sync + 'static,
     {
-        let response = command
-            .call(message.clone(), self.shared_state.clone())
+        // If a timeout is specified, wrap the command in a timeout future
+        let response = if let Some(time_out) = self.time_out {
+            let timeout = time::timeout(
+                time_out,
+                command.call(message.clone(), self.shared_state.clone()),
+            )
             .await;
+
+            if let Ok(response) = timeout {
+                response
+            } else {
+                error!("Command timed out: {}", message.raw_message);
+
+                return Ok(None);
+            }
+        } else {
+            command
+                .call(message.clone(), self.shared_state.clone())
+                .await
+        };
 
         match response {
             Ok(response) => Ok(response),
@@ -217,7 +228,7 @@ impl<T> SourceCmdLogParser<T> {
     ///
     /// # Returns
     /// A result indicating the success or failure of the operation.
-    async fn run_sequence(&mut self, chat_response: &mut ChatResponse) -> SourceCmdResult<()> {
+    async fn run_sequence(&mut self, chat_response: &ChatResponse) -> SourceCmdResult<()> {
         // Function to send a chat message
         async fn send_message(
             enigo: &mut enigo::Enigo,
@@ -226,6 +237,8 @@ impl<T> SourceCmdLogParser<T> {
         ) {
             enigo.key_down(enigo::Key::Layout('Y'));
             enigo.key_up(enigo::Key::Layout('Y'));
+
+            time::sleep(Duration::from_millis(10)).await;
 
             enigo.key_sequence(message);
 
@@ -239,7 +252,7 @@ impl<T> SourceCmdLogParser<T> {
 
         let message = chat_response.message.as_str();
 
-        if message.len() <= 120 {
+        if message.len() <= self.max_entry_length {
             send_message(&mut self.enigo, message, chat_response).await;
 
             return Ok(());
@@ -250,11 +263,11 @@ impl<T> SourceCmdLogParser<T> {
         let mut current_chunk = String::new();
 
         for word in words {
-            if current_chunk.len() + word.len() + 1 > 120 {
+            if current_chunk.len() + word.len() + 1 > self.max_entry_length {
                 // +1 for space
                 send_message(&mut self.enigo, &current_chunk, chat_response).await;
 
-                time::sleep(Duration::from_millis(600)).await;
+                time::sleep(self.chat_delay).await;
 
                 current_chunk.clear();
             }
@@ -269,7 +282,7 @@ impl<T> SourceCmdLogParser<T> {
         if !current_chunk.is_empty() {
             send_message(&mut self.enigo, &current_chunk, chat_response).await;
 
-            time::sleep(Duration::from_millis(600)).await;
+            time::sleep(self.chat_delay).await;
         }
 
         Ok(())
@@ -325,7 +338,7 @@ impl<T> SourceCmdLogParser<T> {
                     if let Some(commands) = self.get_commands(cmd_arg) {
                         for command in commands {
                             responses.extend(self.handle_execution_response(
-                                self.execute_command(command, &message).await?,
+                                self.execute_command(command.as_ref(), &message).await?,
                                 &message,
                             )?);
                         }
@@ -351,10 +364,8 @@ impl<T> SourceCmdLogParser<T> {
 
         reader.seek(SeekFrom::Start(*last_position))?;
 
-        for line in reader.by_ref().lines() {
-            if let Ok(line) = line {
-                lines.push(line);
-            }
+        for line in reader.by_ref().lines().flatten() {
+            lines.push(line);
         }
 
         *last_position = reader.stream_position()?;
@@ -396,40 +407,32 @@ impl<T> Stream for SourceCmdLogParser<T> {
                             return Poll::Ready(Some(Ok(vec![])));
                         }
 
-                        let lines = match SourceCmdLogParser::<T>::read_new_lines(
+                        let lines = SourceCmdLogParser::<T>::read_new_lines(
                             &cmd_parser.file_path,
                             &mut cmd_parser.last_position,
-                        ) {
-                            Ok(lines) => lines,
-                            Err(e) => return Poll::Ready(Some(Err(e))),
-                        };
+                        )?;
 
                         let messages = lines
                             .iter()
-                            .filter_map(|line| cmd_parser.parse_command(line))
+                            .filter_map(|line| cmd_parser.parse_log.parse_command(line))
                             .collect::<Vec<_>>();
 
                         Poll::Ready(Some(Ok(messages)))
                     }
                     Err(e) => {
                         error!("Error: {:?}", e);
-                        // You might want to handle this error more gracefully
-                        Poll::Ready(Some(Err(e.into())))
+                        // Handle error
+                        Poll::Pending
                     }
                 }
             }
             Poll::Ready(None) => {
-                // Stream ended
-                Poll::Ready(None)
+                Poll::Ready(None) // Stream ended
             }
-            Poll::Pending => {
-                // Just return Poll::Pending without waking up the task again
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
-
 
 pub struct SourceCmdBuilder<T> {
     file_path: Option<PathBuf>,
@@ -437,6 +440,15 @@ pub struct SourceCmdBuilder<T> {
     commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
     owner: Option<String>,
     state: Option<T>,
+    parse_log: Option<Box<dyn ParseLog>>,
+    max_entry_length: usize,
+    chat_delay: Duration,
+}
+
+impl<T: Send + Sync + 'static> Default for SourceCmdBuilder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
@@ -447,6 +459,9 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
             commands: HashMap::new(),
             owner: None,
             state: None,
+            parse_log: None,
+            max_entry_length: 128,
+            chat_delay: Duration::from_millis(600),
         }
     }
 
@@ -471,7 +486,7 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
-    pub fn add_commandd<F: SourceCmdFn<T> + 'static>(mut self, function: F) -> Self {
+    pub fn add_global_command<F: SourceCmdFn<T> + 'static>(mut self, function: F) -> Self {
         self.commands
             .entry("".to_string())
             .or_default()
@@ -490,25 +505,45 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
+    pub fn set_parser(mut self, parse_log: Box<dyn ParseLog>) -> Self {
+        self.parse_log = Some(parse_log);
+        self
+    }
+
+    pub fn max_entry_length(mut self, max_entry_length: usize) -> Self {
+        self.max_entry_length = max_entry_length;
+        self
+    }
+
     pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T>> {
-        if let (Some(file_path), Some(state)) = (self.file_path, self.state) {
+        if let (Some(file_path), Some(state), Some(parse_log)) =
+            (self.file_path, self.state, self.parse_log)
+        {
             let (watcher, rx) = SourceCmdLogParser::<T>::async_watcher()?;
 
             Ok(SourceCmdLogParser {
                 file_path,
                 time_out: self.time_out,
                 commands: self.commands,
-                regex: regex::Regex::new(REGEX_STRING)?,
                 watcher,
                 rx,
-                enigo: enigo::Enigo::new(),
+                enigo: {
+                    let mut enigo = enigo::Enigo::new();
+
+                    // Make typing be instant on Linux.
+                    enigo.set_delay(0);
+                    enigo
+                },
                 last_position: 0,
                 owner: self.owner,
                 shared_state: Arc::new(RwLock::new(state)),
+                parse_log,
+                max_entry_length: self.max_entry_length,
+                chat_delay: self.chat_delay,
             })
         } else {
             Err(SourceCmdError::MissingFieldS(
-                "file_path, directory_path, time_out, commands".to_string(),
+                "file_path, state, parse_log".to_string(),
             ))
         }
     }

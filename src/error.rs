@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-pub type SourceCmdResult<T = ()> = std::result::Result<T, SourceCmdError>;
+pub(crate) type SourceCmdResult<T = ()> = std::result::Result<T, SourceCmdError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceCmdError {
@@ -18,4 +18,7 @@ pub enum SourceCmdError {
 
     #[error(transparent)]
     IoError(#[from] std::io::Error),
+
+    #[error(transparent)]
+    CommandTimeOut(#[from] tokio::time::error::Elapsed),
 }
