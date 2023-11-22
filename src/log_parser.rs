@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, atomic::AtomicBool},
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
@@ -124,8 +124,9 @@ pub struct SourceCmdLogParser<T> {
     /// the message is sent by the owner
     chat_delay: Duration,
 
-    /// This is the stop flag that will be used to stop the parser
-    stop_flag: Option<Arc<AtomicBool>>,
+    #[cfg(target_os = "windows")]
+    /// This is the timer used to poll for file changes on windows
+    timer: time::Interval,
 }
 
 impl<T> SourceCmdLogParser<T> {
@@ -329,6 +330,8 @@ impl<T> SourceCmdLogParser<T> {
         // Initial read
         SourceCmdLogParser::<T>::read_new_lines(&self.file_path, &mut self.last_position)?;
 
+        // On windows we are going to do manual polling
+        #[cfg(target_os = "linux")]
         self.watcher
             .watch(parent, notify::RecursiveMode::NonRecursive)?;
 
@@ -393,18 +396,52 @@ impl<T> SourceCmdLogParser<T> {
 impl<T> Stream for SourceCmdLogParser<T> {
     type Item = SourceCmdResult<Vec<ChatMessage>>;
 
+    #[cfg(target_os = "windows")]
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let cmd_parser = self.get_mut();
 
-        // Check if the stop flag is set
-        if let Some(stop_flag) = &cmd_parser.stop_flag {
-            if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return Poll::Ready(None);
+        // Check the file for new data at regular intervals
+        if cmd_parser.timer.poll_tick(cx).is_ready() {
+            debug!("Polling file for new data");
+            // Attempt to read new lines from the file
+            match SourceCmdLogParser::<T>::read_new_lines(
+                &cmd_parser.file_path,
+                &mut cmd_parser.last_position,
+            ) {
+                Ok(lines) => {
+                    let messages = lines
+                        .iter()
+                        .filter_map(|line| cmd_parser.parse_log.parse_command(line))
+                        .collect::<Vec<_>>();
+
+                    if !messages.is_empty() {
+                        return Poll::Ready(Some(Ok(messages)));
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading file: {:?}", e);
+                    // You may choose to return an error or continue polling
+                    return Poll::Ready(Some(Err(e.into())));
+                }
             }
         }
+
+        // If there are no new messages, return Poll::Pending to be polled again
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    #[cfg(target_os = "linux")]
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        
+        
+        let cmd_parser = self.get_mut();
 
         match Pin::new(&mut cmd_parser.rx).poll_next(cx) {
             Poll::Ready(Some(event_result)) => {
@@ -453,7 +490,6 @@ pub struct SourceCmdBuilder<T> {
     parse_log: Option<Box<dyn ParseLog>>,
     max_entry_length: usize,
     chat_delay: Duration,
-    stop_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<T: Send + Sync + 'static> Default for SourceCmdBuilder<T> {
@@ -473,7 +509,6 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
             parse_log: None,
             max_entry_length: 128,
             chat_delay: Duration::from_millis(600),
-            stop_flag: None,
         }
     }
 
@@ -527,11 +562,6 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
-    pub fn stop_flag(mut self, stop_flag: Arc<AtomicBool>) -> Self {
-        self.stop_flag = Some(stop_flag);
-        self
-    }
-
     pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T>> {
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
@@ -547,7 +577,7 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
                 enigo: {
                     let mut enigo = enigo::Enigo::new();
 
-                    // Make typing be instant on Linux.
+                    #[cfg(target_os = "linux")]
                     enigo.set_delay(0);
                     enigo
                 },
@@ -557,7 +587,9 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
                 parse_log,
                 max_entry_length: self.max_entry_length,
                 chat_delay: self.chat_delay,
-                stop_flag: self.stop_flag,
+
+                #[cfg(target_os = "windows")]
+                timer: time::interval(Duration::from_millis(100)),
             })
         } else {
             Err(SourceCmdError::MissingFieldS(

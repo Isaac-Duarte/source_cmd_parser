@@ -49,3 +49,10 @@ This is really just a fun side project, but I would like to implement the follow
 - [x] Mutable state for commands
 - [x] Allow from custom parsing
 
+
+## Windows Support
+Windows support is hack joby because of the following issue.
+
+https://github.com/notify-rs/notify/issues/422#issuecomment-1694703277
+
+But hey it works :)
