@@ -40,8 +40,12 @@ async fn pong(chat_message: ChatMessage) -> Result<Option<ChatResponse>, Box<dyn
 
 There are many other examples including a math expression evaluator, and a ChatGPT bot.
 
+## Demo
+[![DEMO](http://img.youtube.com/vi/TBfJONZ3yAE/0.jpg)](https://www.youtube.com/watch?v=TBfJONZ3yAE "SourceCmdGui Demo")
+
 ## Roadmap
 This is really just a fun side project, but I would like to implement the following.
 - [x] Allow for custom error handling in commands (by expecting a error that implements a custom trait)
 - [x] Mutable state for commands
 - [x] Allow from custom parsing
+
