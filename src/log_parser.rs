@@ -5,7 +5,7 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc},
     task::Poll,
     time::Duration,
 };
@@ -36,7 +36,7 @@ pub type SouceError = Box<dyn std::error::Error>;
 /// to be async.
 pub trait SourceCmdFn<T>: Send + Sync + 'static
 where
-    T: Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
     /// Takes a `ChatMessage` and returns a future resolving to a result
     /// containing an optional chat response.
@@ -50,7 +50,7 @@ where
     fn call(
         &self,
         message: ChatMessage,
-        state: Arc<RwLock<T>>,
+        state: T,
     ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>>;
 }
 
@@ -68,14 +68,14 @@ pub trait ParseLog {
 /// without needing to explicitly wrap it or implement the trait separately.
 impl<F, Fut, T> SourceCmdFn<T> for F
 where
-    F: Fn(ChatMessage, Arc<RwLock<T>>) -> Fut + Sync + Send + 'static,
+    F: Fn(ChatMessage, T) -> Fut + Sync + Send + 'static,
     Fut: Future<Output = Result<Option<ChatResponse>, SouceError>> + Send + 'static,
-    T: Send + Sync + 'static,
+    T: Clone + Send + Sync + 'static,
 {
     fn call(
         &self,
         message: ChatMessage,
-        state: Arc<RwLock<T>>,
+        state: T,
     ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>> {
         Box::pin(self(message, state))
     }
@@ -112,7 +112,7 @@ pub struct SourceCmdLogParser<T> {
     owner: Option<String>,
 
     /// This is the shared state that will be passed to the command functions
-    shared_state: Arc<RwLock<T>>,
+    shared_state: T,
 
     /// This is the parser that will be used to parse chat messages
     parse_log: Box<dyn ParseLog>,
@@ -126,7 +126,7 @@ pub struct SourceCmdLogParser<T> {
 
     /// This is the stop flag that will be used to stop the parser
     stop_flag: Option<Arc<AtomicBool>>,
-    
+
     #[cfg(target_os = "windows")]
     /// This is the timer used to poll for file changes on windows
     timer: time::Interval,
@@ -135,7 +135,7 @@ pub struct SourceCmdLogParser<T> {
 impl<T> SourceCmdLogParser<T> {
     pub fn builder() -> SourceCmdBuilder<T>
     where
-        T: Send + Sync + 'static,
+        T: Clone + Send + Sync + 'static,
     {
         SourceCmdBuilder::<T>::new()
     }
@@ -190,7 +190,7 @@ impl<T> SourceCmdLogParser<T> {
         message: &ChatMessage,
     ) -> SourceCmdResult<Option<ChatResponse>>
     where
-        T: Send + Sync + 'static,
+        T: Clone + Sync + Send + 'static,
     {
         // If a timeout is specified, wrap the command in a timeout future
         let response = if let Some(time_out) = self.time_out {
@@ -325,7 +325,7 @@ impl<T> SourceCmdLogParser<T> {
     /// A result indicating the success or failure of the operation.
     pub async fn run(&mut self) -> SourceCmdResult<()>
     where
-        T: Send + Sync + 'static,
+        T: Unpin + Clone + Send + Sync + 'static,
     {
         let parent = self.file_path.parent().unwrap();
         info!("Watching: {:?}", parent);
@@ -396,7 +396,7 @@ impl<T> SourceCmdLogParser<T> {
 /// - `Poll::Ready(Some(Err(_)))`: When there's an error while reading or parsing the file.
 /// - `Poll::Ready(None)`: When the stream ends, i.e., no more messages are expected.
 /// - `Poll::Pending`: When there's no new data available yet, but the stream hasn't ended.
-impl<T> Stream for SourceCmdLogParser<T> {
+impl<T:  Unpin + Clone + Sync + Send + 'static> Stream for SourceCmdLogParser<T> {
     type Item = SourceCmdResult<Vec<ChatMessage>>;
 
     #[cfg(target_os = "windows")]
@@ -451,7 +451,6 @@ impl<T> Stream for SourceCmdLogParser<T> {
     ) -> std::task::Poll<Option<Self::Item>> {
         let cmd_parser = self.get_mut();
 
-         
         // Check if the stop flag is set
         if let Some(stop_flag) = &cmd_parser.stop_flag {
             if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -509,13 +508,13 @@ pub struct SourceCmdBuilder<T> {
     stop_flag: Option<Arc<AtomicBool>>,
 }
 
-impl<T: Send + Sync + 'static> Default for SourceCmdBuilder<T> {
+impl<T: Clone + Send + Sync + 'static> Default for SourceCmdBuilder<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
+impl<T: Clone + Send + Sync + 'static> SourceCmdBuilder<T> {
     pub fn new() -> Self {
         Self {
             file_path: None,
@@ -606,7 +605,7 @@ impl<T: Send + Sync + 'static> SourceCmdBuilder<T> {
                 },
                 last_position: 0,
                 owner: self.owner,
-                shared_state: Arc::new(RwLock::new(state)),
+                shared_state: state,
                 parse_log,
                 max_entry_length: self.max_entry_length,
                 chat_delay: self.chat_delay,
