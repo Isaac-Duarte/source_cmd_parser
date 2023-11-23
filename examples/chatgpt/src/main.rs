@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .file_path(Box::new(PathBuf::from(
             "/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/log.txt",
         )))
-        .state(State::default())
+        .state(Arc::new(RwLock::new(State::default())))
         .set_parser(Box::new(CSSLogParser::new()))
         .add_command(".explain", explain)
         .add_command(".dad_joke", dad_joke)
