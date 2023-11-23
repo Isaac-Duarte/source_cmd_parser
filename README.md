@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "PATH_OF_LOG_FILE",
         )))
         .set_parser(Box::new(CSSLogParser::new()))
+        .state(())
         .add_command(".ping", pong)
         .owner("USER_NAME") // This is required as it will put an input delay if you type the question.
         .build()?;
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn pong(chat_message: ChatMessage) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
+async fn pong(chat_message: ChatMessage, _: ()) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
     Ok(Some(ChatResponse::new("Pong".to_string())))
 }
 ```
