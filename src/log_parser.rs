@@ -243,9 +243,8 @@ impl<T> SourceCmdLogParser<T> {
             chat_response: &ChatResponse,
         ) {
             enigo.key_down(enigo::Key::Layout('Y'));
+            tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Layout('Y'));
-
-            time::sleep(Duration::from_millis(10)).await;
 
             enigo.key_sequence(message);
 
@@ -254,6 +253,7 @@ impl<T> SourceCmdLogParser<T> {
             }
 
             enigo.key_down(enigo::Key::Return);
+            tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Return);
         }
 
