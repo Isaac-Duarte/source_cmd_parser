@@ -17,7 +17,7 @@ use futures::{
 };
 use log::{debug, error, info};
 use notify::{Config, EventKind, RecommendedWatcher, Watcher};
-use tokio::{sync::RwLock, time};
+use tokio::time;
 
 use crate::{
     error::{SourceCmdError, SourceCmdResult},
@@ -423,7 +423,7 @@ where
         if cmd_parser.timer.poll_tick(cx).is_ready() {
             debug!("Polling file for new data");
             // Attempt to read new lines from the file
-            match SourceCmdLogParser::<T>::read_new_lines(
+            match SourceCmdLogParser::<T, E>::read_new_lines(
                 &cmd_parser.file_path,
                 &mut cmd_parser.last_position,
             ) {
@@ -551,7 +551,11 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         self
     }
 
-    pub fn add_command<F: SourceCmdFn<T, E> + 'static>(mut self, command: &str, function: F) -> Self {
+    pub fn add_command<F: SourceCmdFn<T, E> + 'static>(
+        mut self,
+        command: &str,
+        function: F,
+    ) -> Self {
         self.commands
             .entry(command.to_string())
             .or_default()
