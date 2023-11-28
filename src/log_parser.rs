@@ -24,9 +24,6 @@ use crate::{
     model::{ChatMessage, ChatResponse},
 };
 
-// Maybe change to trait? Not sure
-pub type SouceError = Box<dyn std::error::Error>;
-
 /// The `SourceCmdFn` trait provides a unified interface for functions
 /// that accept a chat message and asynchronously produce a result with
 /// an optional chat response.
@@ -34,9 +31,10 @@ pub type SouceError = Box<dyn std::error::Error>;
 /// This trait ensures thread safety by requiring the `Send`, `Sync`,
 /// and `'static` lifetimes for its implementors which allows the function
 /// to be async.
-pub trait SourceCmdFn<T>: Send + Sync + 'static
+pub trait SourceCmdFn<T, E>: Send + Sync + 'static
 where
     T: Clone + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     /// Takes a `ChatMessage` and returns a future resolving to a result
     /// containing an optional chat response.
@@ -51,7 +49,7 @@ where
         &self,
         message: ChatMessage,
         state: T,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, E>> + Send>>;
 }
 
 /// The `Parse` trait provides a unified interface for users of this library
@@ -66,17 +64,18 @@ pub trait ParseLog {
 ///
 /// This allows for any appropriate function to be treated as a `SourceCmdFn`
 /// without needing to explicitly wrap it or implement the trait separately.
-impl<F, Fut, T> SourceCmdFn<T> for F
+impl<F, Fut, T, E> SourceCmdFn<T, E> for F
 where
     F: Fn(ChatMessage, T) -> Fut + Sync + Send + 'static,
-    Fut: Future<Output = Result<Option<ChatResponse>, SouceError>> + Send + 'static,
+    Fut: Future<Output = Result<Option<ChatResponse>, E>> + Send + 'static,
     T: Clone + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
     fn call(
         &self,
         message: ChatMessage,
         state: T,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, SouceError>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, E>> + Send>> {
         Box::pin(self(message, state))
     }
 }
@@ -86,7 +85,7 @@ where
 ///
 /// It holds the configuration and resources required to monitor a file for changes,
 /// parse the incoming chat commands, and execute the associated actions.
-pub struct SourceCmdLogParser<T> {
+pub struct SourceCmdLogParser<T, E> {
     /// This is the path to the file that will be monitored
     file_path: PathBuf,
 
@@ -94,7 +93,7 @@ pub struct SourceCmdLogParser<T> {
     time_out: Option<Duration>,
 
     /// This is a map of commands to their associated functions
-    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
+    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T, E>>>>,
 
     /// This is the file watcher that will be used to monitor the file
     watcher: RecommendedWatcher,
@@ -132,12 +131,13 @@ pub struct SourceCmdLogParser<T> {
     timer: time::Interval,
 }
 
-impl<T> SourceCmdLogParser<T> {
-    pub fn builder() -> SourceCmdBuilder<T>
+impl<T, E> SourceCmdLogParser<T, E> {
+    pub fn builder() -> SourceCmdBuilder<T, E>
     where
         T: Clone + Send + Sync + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
-        SourceCmdBuilder::<T>::new()
+        SourceCmdBuilder::<T, E>::new()
     }
 
     /// Retrieves the commands associated with a given command string.
@@ -147,7 +147,7 @@ impl<T> SourceCmdLogParser<T> {
     ///
     /// # Returns
     /// An optional reference to a vec of command functions.
-    pub fn get_commands(&self, command: &str) -> Option<&Vec<Box<dyn SourceCmdFn<T>>>> {
+    pub fn get_commands(&self, command: &str) -> Option<&Vec<Box<dyn SourceCmdFn<T, E>>>> {
         self.commands.get(command)
     }
 
@@ -186,11 +186,12 @@ impl<T> SourceCmdLogParser<T> {
     /// An asynchronous result containing an optional `ChatResponse`.
     pub async fn execute_command(
         &self,
-        command: &dyn SourceCmdFn<T>,
+        command: &dyn SourceCmdFn<T, E>,
         message: &ChatMessage,
     ) -> SourceCmdResult<Option<ChatResponse>>
     where
         T: Clone + Sync + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         // If a timeout is specified, wrap the command in a timeout future
         let response = if let Some(time_out) = self.time_out {
@@ -326,12 +327,13 @@ impl<T> SourceCmdLogParser<T> {
     pub async fn run(&mut self) -> SourceCmdResult<()>
     where
         T: Unpin + Clone + Send + Sync + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let parent = self.file_path.parent().unwrap();
         info!("Watching: {:?}", parent);
 
         // Initial read
-        SourceCmdLogParser::<T>::read_new_lines(&self.file_path, &mut self.last_position)?;
+        SourceCmdLogParser::<T, E>::read_new_lines(&self.file_path, &mut self.last_position)?;
 
         // On windows we are going to do manual polling
         #[cfg(target_os = "linux")]
@@ -396,7 +398,11 @@ impl<T> SourceCmdLogParser<T> {
 /// - `Poll::Ready(Some(Err(_)))`: When there's an error while reading or parsing the file.
 /// - `Poll::Ready(None)`: When the stream ends, i.e., no more messages are expected.
 /// - `Poll::Pending`: When there's no new data available yet, but the stream hasn't ended.
-impl<T:  Unpin + Clone + Sync + Send + 'static> Stream for SourceCmdLogParser<T> {
+impl<T, E> Stream for SourceCmdLogParser<T, E>
+where
+    T: Unpin + Clone + Sync + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
     type Item = SourceCmdResult<Vec<ChatMessage>>;
 
     #[cfg(target_os = "windows")]
@@ -469,7 +475,7 @@ impl<T:  Unpin + Clone + Sync + Send + 'static> Stream for SourceCmdLogParser<T>
                             return Poll::Ready(Some(Ok(vec![])));
                         }
 
-                        let lines = SourceCmdLogParser::<T>::read_new_lines(
+                        let lines = SourceCmdLogParser::<T, E>::read_new_lines(
                             &cmd_parser.file_path,
                             &mut cmd_parser.last_position,
                         )?;
@@ -496,10 +502,10 @@ impl<T:  Unpin + Clone + Sync + Send + 'static> Stream for SourceCmdLogParser<T>
     }
 }
 
-pub struct SourceCmdBuilder<T> {
+pub struct SourceCmdBuilder<T, E> {
     file_path: Option<PathBuf>,
     time_out: Option<Duration>,
-    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T>>>>,
+    commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T, E>>>>,
     owner: Option<String>,
     state: Option<T>,
     parse_log: Option<Box<dyn ParseLog>>,
@@ -508,13 +514,17 @@ pub struct SourceCmdBuilder<T> {
     stop_flag: Option<Arc<AtomicBool>>,
 }
 
-impl<T: Clone + Send + Sync + 'static> Default for SourceCmdBuilder<T> {
+impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static> Default
+    for SourceCmdBuilder<T, E>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> SourceCmdBuilder<T> {
+impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static>
+    SourceCmdBuilder<T, E>
+{
     pub fn new() -> Self {
         Self {
             file_path: None,
@@ -541,7 +551,7 @@ impl<T: Clone + Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
-    pub fn add_command<F: SourceCmdFn<T> + 'static>(mut self, command: &str, function: F) -> Self {
+    pub fn add_command<F: SourceCmdFn<T, E> + 'static>(mut self, command: &str, function: F) -> Self {
         self.commands
             .entry(command.to_string())
             .or_default()
@@ -550,7 +560,7 @@ impl<T: Clone + Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
-    pub fn add_global_command<F: SourceCmdFn<T> + 'static>(mut self, function: F) -> Self {
+    pub fn add_global_command<F: SourceCmdFn<T, E> + 'static>(mut self, function: F) -> Self {
         self.commands
             .entry("".to_string())
             .or_default()
@@ -584,11 +594,11 @@ impl<T: Clone + Send + Sync + 'static> SourceCmdBuilder<T> {
         self
     }
 
-    pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T>> {
+    pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T, E>> {
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
         {
-            let (watcher, rx) = SourceCmdLogParser::<T>::async_watcher()?;
+            let (watcher, rx) = SourceCmdLogParser::<T, E>::async_watcher()?;
 
             Ok(SourceCmdLogParser {
                 file_path,
