@@ -42,7 +42,7 @@ async fn pong(chat_message: ChatMessage, _: ()) -> Result<Option<ChatResponse>, 
 There are many other examples including a math expression evaluator, and a ChatGPT bot.
 
 ## Demo
-[![DEMO](http://img.youtube.com/vi/TBfJONZ3yAE/0.jpg)](https://www.youtube.com/watch?v=TBfJONZ3yAE "SourceCmdGui Demo")
+[![DEMO](http://img.youtube.com/vi/mpB4AqHFvOA/0.jpg)](https://www.youtube.com/watch?v=tXPQ1c23jj4 "SourceCmdGui Demo")
 
 ## Roadmap
 This is really just a fun side project, but I would like to implement the following.
