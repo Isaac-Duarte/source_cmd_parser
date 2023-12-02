@@ -703,13 +703,16 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
         {
+            #[cfg(target_os = "linux")]
             let (watcher, rx) = SourceCmdLogParser::<T, E>::async_watcher()?;
 
             Ok(SourceCmdLogParser {
                 file_path,
                 time_out: self.time_out,
                 commands: self.commands,
+                #[cfg(target_os = "linux")]
                 watcher,
+                #[cfg(target_os = "linux")]
                 rx,
                 enigo: {
                     let mut enigo = enigo::Enigo::new();
