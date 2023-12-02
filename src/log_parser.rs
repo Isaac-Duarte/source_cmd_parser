@@ -96,9 +96,11 @@ pub struct SourceCmdLogParser<T, E> {
     commands: HashMap<String, Vec<Box<dyn SourceCmdFn<T, E>>>>,
 
     /// This is the file watcher that will be used to monitor the file
+    #[cfg(target_os = "linux")]
     watcher: RecommendedWatcher,
 
     /// This is the receiver for the file watcher
+    #[cfg(target_os = "linux")]
     rx: Receiver<notify::Result<notify::Event>>,
 
     /// This is the enigo instance that will be used to send key presses
@@ -239,6 +241,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
     ///
     /// # Returns
     /// A result indicating the success or failure of the operation.
+    #[cfg(target_os = "linux")]
     async fn run_sequence(&mut self, chat_response: &ChatResponse) -> SourceCmdResult<()> {
         // Function to send a chat message
         async fn send_message(
@@ -260,6 +263,90 @@ impl<T, E> SourceCmdLogParser<T, E> {
             enigo.key_down(enigo::Key::Return);
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Return);
+        }
+
+        let message = chat_response.message.as_str();
+
+        if message.len() <= self.max_entry_length {
+            send_message(&mut self.enigo, message, chat_response, self.chat_key).await;
+
+            return Ok(());
+        }
+
+        let words = message.split_whitespace();
+
+        let mut current_chunk = String::new();
+
+        for word in words {
+            if current_chunk.len() + word.len() + 1 > self.max_entry_length {
+                // +1 for space
+                send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+
+                time::sleep(self.chat_delay).await;
+
+                current_chunk.clear();
+            }
+
+            if !current_chunk.is_empty() {
+                current_chunk.push(' ');
+            }
+            current_chunk.push_str(word);
+        }
+
+        // Send any remaining chunk
+        if !current_chunk.is_empty() {
+            send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+
+            time::sleep(self.chat_delay).await;
+        }
+
+        Ok(())
+    }
+
+    /// Runs a sequence of actions based on the provided `ChatResponse`.
+    ///
+    /// This method triggers the sequence of key presses based on the `chat_response` message,
+    /// and, if provided, it waits for a specified delay before pressing the 'Enter' key.
+    ///
+    /// # Parameters
+    /// - `chat_response`: The chat response containing the message sequence.
+    ///
+    /// # Returns
+    /// A result indicating the success or failure of the operation.
+    #[cfg(target_os = "windows")]
+    async fn run_sequence(&mut self, chat_response: &ChatResponse) -> SourceCmdResult<()> {
+        use clipboard_win::set_clipboard_string;
+
+        // Function to send a chat message
+        async fn send_message(
+            enigo: &mut enigo::Enigo,
+            message: &str,
+            chat_response: &ChatResponse,
+            chat_key: enigo::Key,
+        ) -> SourceCmdResult<()> {
+            enigo.key_down(chat_key);
+            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            enigo.key_up(chat_key);
+            
+            // Set Clipboard
+            set_clipboard_string(message).map_err(|err| SourceCmdError::ClipboardError(err.to_string()))?;
+
+            // Ctrl + V
+            enigo.key_down(enigo::Key::Control);
+            enigo.key_down(enigo::Key::Layout('v'));
+            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            enigo.key_up(enigo::Key::Control);
+            enigo.key_up(enigo::Key::Layout('v'));
+            
+            if let Some(delay) = chat_response.delay_on_enter {
+                time::sleep(delay).await;
+            }
+
+            enigo.key_down(enigo::Key::Return);
+            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            enigo.key_up(enigo::Key::Return);
+
+            Ok(())
         }
 
         let message = chat_response.message.as_str();
@@ -541,7 +628,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
             max_entry_length: 128,
             chat_delay: Duration::from_millis(600),
             stop_flag: None,
-            chat_key: enigo::Key::Layout('Y'),
+            chat_key: enigo::Key::Layout('y'),
         }
     }
 
@@ -613,13 +700,16 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
         {
+            #[cfg(target_os = "linux")]
             let (watcher, rx) = SourceCmdLogParser::<T, E>::async_watcher()?;
 
             Ok(SourceCmdLogParser {
                 file_path,
                 time_out: self.time_out,
                 commands: self.commands,
+                #[cfg(target_os = "linux")]
                 watcher,
+                #[cfg(target_os = "linux")]
                 rx,
                 enigo: {
                     let mut enigo = enigo::Enigo::new();
