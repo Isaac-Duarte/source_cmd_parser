@@ -21,4 +21,8 @@ pub enum SourceCmdError {
 
     #[error(transparent)]
     CommandTimeOut(#[from] tokio::time::error::Elapsed),
+
+    #[cfg(target_os="windows")]
+    #[error("Unable to set clipboard: {0}")]
+    ClipboardError(String)
 }
