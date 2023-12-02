@@ -126,6 +126,9 @@ pub struct SourceCmdLogParser<T, E> {
     /// This is the stop flag that will be used to stop the parser
     stop_flag: Option<Arc<AtomicBool>>,
 
+    /// This is the key that will be used to send chat messages
+    chat_key: enigo::Key,
+
     #[cfg(target_os = "windows")]
     /// This is the timer used to poll for file changes on windows
     timer: time::Interval,
@@ -242,8 +245,9 @@ impl<T, E> SourceCmdLogParser<T, E> {
             enigo: &mut enigo::Enigo,
             message: &str,
             chat_response: &ChatResponse,
+            chat_key: enigo::Key,
         ) {
-            enigo.key_down(enigo::Key::Layout('Y'));
+            enigo.key_down(chat_key);
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Layout('Y'));
 
@@ -261,7 +265,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         let message = chat_response.message.as_str();
 
         if message.len() <= self.max_entry_length {
-            send_message(&mut self.enigo, message, chat_response).await;
+            send_message(&mut self.enigo, message, chat_response, self.chat_key).await;
 
             return Ok(());
         }
@@ -273,7 +277,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         for word in words {
             if current_chunk.len() + word.len() + 1 > self.max_entry_length {
                 // +1 for space
-                send_message(&mut self.enigo, &current_chunk, chat_response).await;
+                send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
 
                 time::sleep(self.chat_delay).await;
 
@@ -288,7 +292,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
 
         // Send any remaining chunk
         if !current_chunk.is_empty() {
-            send_message(&mut self.enigo, &current_chunk, chat_response).await;
+            send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
 
             time::sleep(self.chat_delay).await;
         }
@@ -512,6 +516,7 @@ pub struct SourceCmdBuilder<T, E> {
     max_entry_length: usize,
     chat_delay: Duration,
     stop_flag: Option<Arc<AtomicBool>>,
+    chat_key: enigo::Key,
 }
 
 impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static> Default
@@ -536,6 +541,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
             max_entry_length: 128,
             chat_delay: Duration::from_millis(600),
             stop_flag: None,
+            chat_key: enigo::Key::Layout('Y'),
         }
     }
 
@@ -598,6 +604,11 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         self
     }
 
+    pub fn chat_key(mut self, chat_key: enigo::Key) -> Self {
+        self.chat_key = chat_key;
+        self
+    }
+
     pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T, E>> {
         if let (Some(file_path), Some(state), Some(parse_log)) =
             (self.file_path, self.state, self.parse_log)
@@ -624,6 +635,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
                 max_entry_length: self.max_entry_length,
                 chat_delay: self.chat_delay,
                 stop_flag: self.stop_flag,
+                chat_key: self.chat_key,
 
                 #[cfg(target_os = "windows")]
                 timer: time::interval(Duration::from_millis(100)),
