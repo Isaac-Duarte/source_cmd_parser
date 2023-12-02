@@ -330,7 +330,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
             
             // Set Clipboard
             set_clipboard_string(message).map_err(|err| SourceCmdError::ClipboardError(err.to_string()))?;
-            tokio::time::sleep(time::Duration::from_millis(50)).await;
 
             // Ctrl + V
             enigo.key_down(enigo::Key::Control);
@@ -338,9 +337,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Control);
             enigo.key_up(enigo::Key::Layout('v'));
-
-            tokio::time::sleep(time::Duration::from_millis(50)).await;
-
+            
             if let Some(delay) = chat_response.delay_on_enter {
                 time::sleep(delay).await;
             }
