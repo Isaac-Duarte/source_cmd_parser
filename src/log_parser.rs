@@ -266,7 +266,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
             chat_key: enigo::Key,
         ) {
             enigo.key_down(chat_key);
-            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(chat_key);
 
             enigo.key_sequence(message);
@@ -276,7 +276,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
             }
 
             enigo.key_down(enigo::Key::Return);
-            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Return);
         }
 
