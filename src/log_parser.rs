@@ -413,7 +413,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
             if config
                 .owner
                 .as_ref()
-                .is_some_and(|owner| owner == &message.user_name)
+                .is_some_and(|owner| message.user_name.contains(owner))
             {
                 response.delay_on_enter = Some(config.chat_delay);
             }
