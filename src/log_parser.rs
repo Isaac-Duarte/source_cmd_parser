@@ -470,7 +470,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
                                     )
                                     .await?;
 
-                                    let mut enigo = cloned_enigo.lock().await;
                                     let response = Self::handle_execution_response(
                                         &cloned_config,
                                         response,
@@ -478,6 +477,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
                                     );
 
                                     if let Some(response) = response {
+                                        let mut enigo = cloned_enigo.lock().await;
+                                        
                                         Self::run_sequence(&cloned_config, &mut enigo, &response)
                                             .await?;
                                     }
