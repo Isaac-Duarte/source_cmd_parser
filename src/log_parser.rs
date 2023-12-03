@@ -313,7 +313,11 @@ impl<T, E> SourceCmdLogParser<T, E> {
     /// # Returns
     /// A result indicating the success or failure of the operation.
     #[cfg(target_os = "windows")]
-    async fn run_sequence(&mut self, chat_response: &ChatResponse) -> SourceCmdResult<()> {
+    async fn run_sequence(
+        config: &Config<T>,
+        enigo: &mut enigo::Enigo,
+        chat_response: &ChatResponse,
+    ) -> SourceCmdResult<()> {
         use clipboard_win::set_clipboard_string;
 
         // Function to send a chat message
@@ -351,8 +355,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
 
         let message = chat_response.message.as_str();
 
-        if message.len() <= self.max_entry_length {
-            send_message(&mut self.enigo, message, chat_response, self.chat_key).await;
+        if message.len() <= config.max_entry_length {
+            send_message(enigo, message, chat_response, config.chat_key).await;
 
             return Ok(());
         }
@@ -362,17 +366,17 @@ impl<T, E> SourceCmdLogParser<T, E> {
         let mut current_chunk = String::new();
 
         for word in words {
-            if current_chunk.len() + word.len() + 1 > self.max_entry_length {
+            if current_chunk.len() + word.len() + 1 > config.max_entry_length {
                 // +1 for space
                 send_message(
-                    &mut self.enigo,
+                    enigo,
                     &current_chunk,
                     chat_response,
-                    self.chat_key,
+                    config.chat_key,
                 )
                 .await;
 
-                time::sleep(self.chat_delay).await;
+                time::sleep(config.chat_delay).await;
 
                 current_chunk.clear();
             }
@@ -386,14 +390,14 @@ impl<T, E> SourceCmdLogParser<T, E> {
         // Send any remaining chunk
         if !current_chunk.is_empty() {
             send_message(
-                &mut self.enigo,
+                enigo,
                 &current_chunk,
                 chat_response,
-                self.chat_key,
+                config.chat_key,
             )
             .await;
 
-            time::sleep(self.chat_delay).await;
+            time::sleep(config.chat_delay).await;
         }
 
         Ok(())
@@ -547,18 +551,18 @@ where
         let cmd_parser = self.get_mut();
 
         // Check if the stop flag is set
-        if let Some(stop_flag) = &cmd_parser.stop_flag {
+        if let Some(stop_flag) = &cmd_parser.config.stop_flag {
             if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return Poll::Ready(None);
             }
         }
 
         // Check the file for new data at regular intervals
-        if cmd_parser.timer.poll_tick(cx).is_ready() {
+        if cmd_parser.config.timer.poll_tick(cx).is_ready() {
             debug!("Polling file for new data");
             // Attempt to read new lines from the file
             match SourceCmdLogParser::<T, E>::read_new_lines(
-                &cmd_parser.file_path,
+                &cmd_parser.config.file_path,
                 &mut cmd_parser.last_position,
             ) {
                 Ok(lines) => {
