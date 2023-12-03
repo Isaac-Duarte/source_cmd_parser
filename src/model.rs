@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{time::Duration, path::PathBuf, sync::{Arc, atomic::AtomicBool}};
 
 use chrono::{DateTime, Utc};
 
@@ -44,4 +44,35 @@ impl ChatResponse {
             delay_on_enter: Some(delay_on_enter),
         }
     }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct Config<T> {
+    /// This is the path to the file that will be monitored
+    pub(crate) file_path: PathBuf,
+
+    /// This is the timeout for commands
+    pub(crate) time_out: Option<Duration>,
+
+    /// This is the user name of the owner of the commands
+    pub(crate) owner: Option<String>,
+
+    /// This is the shared state that will be passed to the command functions
+    pub(crate) shared_state: T,
+
+    /// This is the max length of a chat message that will be sent in one chunk
+    pub(crate) max_entry_length: usize,
+
+    /// This is the delay between each chunk of a long message, or when
+    /// the message is sent by the owner
+    pub(crate) chat_delay: Duration,
+
+    /// This is the stop flag that will be used to stop the parser
+    pub(crate) stop_flag: Option<Arc<AtomicBool>>,
+
+    /// This is the key that will be used to send chat messages
+    pub(crate) chat_key: enigo::Key,
+
+    pub(crate) threads: usize, 
 }
