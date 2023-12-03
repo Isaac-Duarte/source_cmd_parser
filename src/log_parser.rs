@@ -558,7 +558,7 @@ where
         }
 
         // Check the file for new data at regular intervals
-        if cmd_parser.config.timer.poll_tick(cx).is_ready() {
+        if cmd_parser.timer.poll_tick(cx).is_ready() {
             debug!("Polling file for new data");
             // Attempt to read new lines from the file
             match SourceCmdLogParser::<T, E>::read_new_lines(
