@@ -220,7 +220,22 @@ impl<T, E> SourceCmdLogParser<T, E> {
         };
 
         match response {
-            Ok(response) => Ok(response),
+            Ok(response) => {
+                // Modify chat resposne if the user is the owner to add a delay
+                if self
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner == &message.user_name)
+                    && response.is_some()
+                {
+                    Ok(Some(ChatResponse {
+                        message: response.unwrap().message,
+                        delay_on_enter: Some(Duration::from_millis(700)),
+                    }))
+                } else {
+                    Ok(response)
+                }
+            }
             Err(err) => {
                 error!(
                     "Error whil executing command {}: {:?}",
@@ -280,7 +295,13 @@ impl<T, E> SourceCmdLogParser<T, E> {
         for word in words {
             if current_chunk.len() + word.len() + 1 > self.max_entry_length {
                 // +1 for space
-                send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+                send_message(
+                    &mut self.enigo,
+                    &current_chunk,
+                    chat_response,
+                    self.chat_key,
+                )
+                .await;
 
                 time::sleep(self.chat_delay).await;
 
@@ -295,7 +316,13 @@ impl<T, E> SourceCmdLogParser<T, E> {
 
         // Send any remaining chunk
         if !current_chunk.is_empty() {
-            send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+            send_message(
+                &mut self.enigo,
+                &current_chunk,
+                chat_response,
+                self.chat_key,
+            )
+            .await;
 
             time::sleep(self.chat_delay).await;
         }
@@ -327,9 +354,10 @@ impl<T, E> SourceCmdLogParser<T, E> {
             enigo.key_down(chat_key);
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(chat_key);
-            
+
             // Set Clipboard
-            set_clipboard_string(message).map_err(|err| SourceCmdError::ClipboardError(err.to_string()))?;
+            set_clipboard_string(message)
+                .map_err(|err| SourceCmdError::ClipboardError(err.to_string()))?;
 
             // Ctrl + V
             enigo.key_down(enigo::Key::Control);
@@ -337,7 +365,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Control);
             enigo.key_up(enigo::Key::Layout('v'));
-            
+
             if let Some(delay) = chat_response.delay_on_enter {
                 time::sleep(delay).await;
             }
@@ -364,7 +392,13 @@ impl<T, E> SourceCmdLogParser<T, E> {
         for word in words {
             if current_chunk.len() + word.len() + 1 > self.max_entry_length {
                 // +1 for space
-                send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+                send_message(
+                    &mut self.enigo,
+                    &current_chunk,
+                    chat_response,
+                    self.chat_key,
+                )
+                .await;
 
                 time::sleep(self.chat_delay).await;
 
@@ -379,7 +413,13 @@ impl<T, E> SourceCmdLogParser<T, E> {
 
         // Send any remaining chunk
         if !current_chunk.is_empty() {
-            send_message(&mut self.enigo, &current_chunk, chat_response, self.chat_key).await;
+            send_message(
+                &mut self.enigo,
+                &current_chunk,
+                chat_response,
+                self.chat_key,
+            )
+            .await;
 
             time::sleep(self.chat_delay).await;
         }
