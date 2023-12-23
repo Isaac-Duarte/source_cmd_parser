@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_parser(Box::new(CSSLogParser::new()))
         .add_command(".explain", explain)
         .add_command(".dad_joke", dad_joke)
-        .owner("***REMOVED***")
+        .owner("username")
         .build()?;
 
     parser.run().await?;

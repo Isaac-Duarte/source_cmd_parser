@@ -39,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .state(Arc::new(RwLock::new(State::default())))
         .set_parser(Box::new(CSSLogParser::new()))
         .add_global_command(eval)
-        .owner("***REMOVED***")
+        .owner("username")
         .build()?;
 
     parser.run().await?;
