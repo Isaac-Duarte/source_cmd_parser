@@ -1,4 +1,8 @@
-use std::{time::Duration, path::PathBuf, sync::{Arc, atomic::AtomicBool}};
+use std::{
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
 
@@ -46,7 +50,6 @@ impl ChatResponse {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Config<T> {
     /// This is the path to the file that will be monitored
@@ -74,5 +77,5 @@ pub struct Config<T> {
     /// This is the key that will be used to send chat messages
     pub(crate) chat_key: enigo::Key,
 
-    pub(crate) threads: usize, 
+    pub(crate) threads: usize,
 }

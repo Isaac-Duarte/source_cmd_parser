@@ -3,6 +3,7 @@ use std::{
     fs::File,
     future::Future,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    marker::PhantomData,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{atomic::AtomicBool, Arc},
@@ -10,7 +11,8 @@ use std::{
     time::Duration,
 };
 
-use enigo::KeyboardControllable;
+use clipboard_rs::ClipboardContext;
+use enigo::{Key, KeyboardControllable};
 use futures::{
     channel::mpsc::{channel, Receiver},
     SinkExt, Stream, StreamExt,
@@ -18,7 +20,10 @@ use futures::{
 use log::{debug, error, info};
 use notify::{EventKind, RecommendedWatcher, Watcher};
 use rayon::ThreadPoolBuilder;
-use tokio::{sync::Mutex, time};
+use tokio::{
+    sync::{Mutex, MutexGuard},
+    time,
+};
 
 use crate::{
     error::{SourceCmdError, SourceCmdResult},
@@ -50,7 +55,8 @@ where
         &self,
         message: ChatMessage,
         state: T,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, E>> + Send>>;
+        keyboard: Keyboard<T, E>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), E>> + Send>>;
 }
 
 /// Implementation of `SourceCmdFn` for any function type `F` that meets
@@ -60,8 +66,8 @@ where
 /// without needing to explicitly wrap it or implement the trait separately.
 impl<F, Fut, T, E> SourceCmdFn<T, E> for F
 where
-    F: Fn(ChatMessage, T) -> Fut + Sync + Send + 'static,
-    Fut: Future<Output = Result<Option<ChatResponse>, E>> + Send + 'static,
+    F: Fn(ChatMessage, T, Keyboard<T, E>) -> Fut + Sync + Send + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
     T: Clone + Send + Sync + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
@@ -69,8 +75,9 @@ where
         &self,
         message: ChatMessage,
         state: T,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChatResponse>, E>> + Send>> {
-        Box::pin(self(message, state))
+        keyboard: Keyboard<T, E>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), E>> + Send>> {
+        Box::pin(self(message, state, keyboard))
     }
 }
 
@@ -114,6 +121,41 @@ pub struct SourceCmdLogParser<T, E> {
     #[cfg(target_os = "windows")]
     /// This is the timer used to poll for file changes on windows
     timer: time::Interval,
+}
+
+pub struct Keyboard<State, E: std::error::Error + Send + Sync + 'static> {
+    chat_message: ChatMessage,
+    enigo: Arc<Mutex<enigo::Enigo>>,
+    config: Config<State>,
+    _er: PhantomData<E>,
+    clipboard_ctx: Arc<ClipboardContext>,
+}
+
+impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
+    pub async fn simulate(&mut self, message: String) -> SourceCmdResult<()> {
+        let mut response = ChatResponse::new(message.to_string());
+
+        if self
+            .config
+            .owner
+            .as_ref()
+            .is_some_and(|owner| self.chat_message.user_name.contains(owner))
+        {
+            response.delay_on_enter = Some(self.config.chat_delay);
+        }
+
+        SourceCmdLogParser::<_, E>::run_sequence(
+            &self.config,
+            self.enigo.clone(),
+            response,
+            self.clipboard_ctx.clone(),
+        )
+        .await?;
+
+        tokio::time::sleep(self.config.chat_delay).await;
+
+        Ok(())
+    }
 }
 
 impl<T, E> SourceCmdLogParser<T, E> {
@@ -173,7 +215,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
         config: &Config<T>,
         command: &dyn SourceCmdFn<T, E>,
         message: &ChatMessage,
-    ) -> SourceCmdResult<Option<ChatResponse>>
+        keyboard: Keyboard<T, E>,
+    ) -> SourceCmdResult<()>
     where
         T: Clone + Sync + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
@@ -182,7 +225,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         let response = if let Some(time_out) = config.time_out {
             let timeout = time::timeout(
                 time_out,
-                command.call(message.clone(), config.shared_state.clone()),
+                command.call(message.clone(), config.shared_state.clone(), keyboard),
             )
             .await;
 
@@ -191,37 +234,23 @@ impl<T, E> SourceCmdLogParser<T, E> {
             } else {
                 error!("Command timed out: {}", message.raw_message);
 
-                return Ok(None);
+                return Ok(());
             }
         } else {
             command
-                .call(message.clone(), config.shared_state.clone())
+                .call(message.clone(), config.shared_state.clone(), keyboard)
                 .await
         };
 
         match response {
-            Ok(response) => {
-                // Modify chat resposne if the user is the owner to add a delay
-                if config
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| owner == &message.user_name)
-                    && response.is_some()
-                {
-                    Ok(Some(ChatResponse {
-                        message: response.unwrap().message,
-                        delay_on_enter: Some(config.chat_delay),
-                    }))
-                } else {
-                    Ok(response)
-                }
-            }
+            Ok(response) => Ok(()),
             Err(err) => {
                 error!(
                     "Error whil executing command {}: {:?}",
                     message.command, err
                 );
-                Ok(None)
+
+                Ok(())
             }
         }
     }
@@ -239,124 +268,52 @@ impl<T, E> SourceCmdLogParser<T, E> {
     #[cfg(target_os = "linux")]
     async fn run_sequence(
         config: &Config<T>,
-        enigo: &mut enigo::Enigo,
-        chat_response: &ChatResponse,
+        enigo: Arc<Mutex<enigo::Enigo>>,
+        chat_response: ChatResponse,
+        ctx: Arc<ClipboardContext>,
     ) -> SourceCmdResult<()> {
+        use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+
         // Function to send a chat message
-        async fn send_message(
-            enigo: &mut enigo::Enigo,
+        async fn send_message<'a>(
+            enigo: &mut MutexGuard<'a, enigo::Enigo>,
             message: &str,
             chat_response: &ChatResponse,
             chat_key: enigo::Key,
+            ctx: &ClipboardContext,
         ) {
+            // Copy message to clipboard
+            ctx.set_text(message.to_string()).unwrap();
+
+            // Simulate pressing chat key (e.g., open chat window)
             enigo.key_down(chat_key);
             time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(chat_key);
 
-            enigo.key_sequence(message);
-
-            if let Some(delay) = chat_response.delay_on_enter {
-                time::sleep(delay).await;
-            }
-
-            enigo.key_down(enigo::Key::Return);
-            time::sleep(time::Duration::from_millis(20)).await;
-            enigo.key_up(enigo::Key::Return);
-        }
-
-        let message = chat_response.message.as_str();
-
-        if message.len() <= config.max_entry_length {
-            send_message(enigo, message, chat_response, config.chat_key).await;
-
-            return Ok(());
-        }
-
-        let words = message.split_whitespace();
-
-        let mut current_chunk = String::new();
-
-        for word in words {
-            if current_chunk.len() + word.len() + 1 > config.max_entry_length {
-                // +1 for space
-                send_message(enigo, &current_chunk, chat_response, config.chat_key).await;
-
-                time::sleep(config.chat_delay).await;
-
-                current_chunk.clear();
-            }
-
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
-            }
-            current_chunk.push_str(word);
-        }
-
-        // Send any remaining chunk
-        if !current_chunk.is_empty() {
-            send_message(enigo, &current_chunk, chat_response, config.chat_key).await;
-
-            time::sleep(config.chat_delay).await;
-        }
-
-        Ok(())
-    }
-
-    /// Runs a sequence of actions based on the provided `ChatResponse`.
-    ///
-    /// This method triggers the sequence of key presses based on the `chat_response` message,
-    /// and, if provided, it waits for a specified delay before pressing the 'Enter' key.
-    ///
-    /// # Parameters
-    /// - `chat_response`: The chat response containing the message sequence.
-    ///
-    /// # Returns
-    /// A result indicating the success or failure of the operation.
-    #[cfg(target_os = "windows")]
-    async fn run_sequence(
-        config: &Config<T>,
-        enigo: &mut enigo::Enigo,
-        chat_response: &ChatResponse,
-    ) -> SourceCmdResult<()> {
-        use clipboard_win::set_clipboard_string;
-
-        // Function to send a chat message
-        async fn send_message(
-            enigo: &mut enigo::Enigo,
-            message: &str,
-            chat_response: &ChatResponse,
-            chat_key: enigo::Key,
-        ) -> SourceCmdResult<()> {
-            enigo.key_down(chat_key);
-            tokio::time::sleep(time::Duration::from_millis(20)).await;
-            enigo.key_up(chat_key);
-
-            // Set Clipboard
-            set_clipboard_string(message)
-                .map_err(|err| SourceCmdError::ClipboardError(err.to_string()))?;
-
-            // Ctrl + V
+            // Simulate Ctrl+V to paste the message
             enigo.key_down(enigo::Key::Control);
             enigo.key_down(enigo::Key::Layout('v'));
             tokio::time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Control);
             enigo.key_up(enigo::Key::Layout('v'));
 
+            // Wait if there is any delay before pressing Enter
             if let Some(delay) = chat_response.delay_on_enter {
                 time::sleep(delay).await;
             }
 
+            // Simulate pressing Enter to send the message
             enigo.key_down(enigo::Key::Return);
-            tokio::time::sleep(time::Duration::from_millis(20)).await;
+            time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Return);
-
-            Ok(())
         }
+
+        let mut enigo = enigo.lock().await;
 
         let message = chat_response.message.as_str();
 
         if message.len() <= config.max_entry_length {
-            send_message(enigo, message, chat_response, config.chat_key).await;
+            send_message(&mut enigo, message, &chat_response, config.chat_key, &ctx).await;
 
             return Ok(());
         }
@@ -369,10 +326,11 @@ impl<T, E> SourceCmdLogParser<T, E> {
             if current_chunk.len() + word.len() + 1 > config.max_entry_length {
                 // +1 for space
                 send_message(
-                    enigo,
+                    &mut enigo,
                     &current_chunk,
-                    chat_response,
+                    &chat_response,
                     config.chat_key,
+                    &ctx,
                 )
                 .await;
 
@@ -390,10 +348,11 @@ impl<T, E> SourceCmdLogParser<T, E> {
         // Send any remaining chunk
         if !current_chunk.is_empty() {
             send_message(
-                enigo,
+                &mut enigo,
                 &current_chunk,
-                chat_response,
+                &chat_response,
                 config.chat_key,
+                &ctx,
             )
             .await;
 
@@ -451,6 +410,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
             .num_threads(self.config.threads)
             .build()?;
 
+        let ctx = Arc::new(ClipboardContext::new().unwrap());
+
         while let Some(messages) = self.next().await {
             for message in messages? {
                 // This will execute the desingated command, and commands with no prefix
@@ -462,30 +423,27 @@ impl<T, E> SourceCmdLogParser<T, E> {
                             let cloned_message = message.clone();
                             let cloned_enigo: Arc<Mutex<enigo::Enigo>> = self.enigo.clone();
                             let cloned_command = command.clone();
+                            let cloned_clipboard_context = ctx.clone();
 
                             pool.spawn(move || {
                                 let runtime = tokio::runtime::Runtime::new().unwrap();
 
                                 let response: SourceCmdResult = runtime.block_on(async {
-                                    let response = Self::execute_command(
+                                    let keyboard = Keyboard {
+                                        enigo: cloned_enigo,
+                                        config: cloned_config.clone(),
+                                        chat_message: cloned_message.clone(),
+                                        _er: PhantomData,
+                                        clipboard_ctx: cloned_clipboard_context,
+                                    };
+
+                                    Self::execute_command(
                                         &cloned_config,
                                         cloned_command.as_ref(),
                                         &cloned_message,
+                                        keyboard,
                                     )
                                     .await?;
-
-                                    let response = Self::handle_execution_response(
-                                        &cloned_config,
-                                        response,
-                                        &cloned_message,
-                                    );
-
-                                    if let Some(response) = response {
-                                        let mut enigo = cloned_enigo.lock().await;
-                                        
-                                        Self::run_sequence(&cloned_config, &mut enigo, &response)
-                                            .await?;
-                                    }
 
                                     Ok(())
                                 });
