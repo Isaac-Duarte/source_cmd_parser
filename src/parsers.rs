@@ -70,10 +70,28 @@ fn parse_using_regex(regex: &Regex, raw_message: &str) -> Option<ChatMessage> {
     let raw_message = raw_message.trim().to_string();
 
     if let Some(captures) = regex.captures(&raw_message) {
-        let user_name = captures.get(3).unwrap().as_str().to_string();
-        let message = captures.get(4).unwrap().as_str().to_string();
-        let command = message.split_whitespace().next().unwrap().to_string();
-        let raw_message = message.clone();
+        // Safely extract user name (capture group 3)
+        let user_name = captures.get(3)?.as_str().to_string();
+        
+        // Safely extract message (capture group 4)
+        let message = captures.get(4)?.as_str().to_string();
+        
+        // Handle empty messages
+        if message.trim().is_empty() {
+            debug!("Empty message from user: {}", user_name);
+            return None;
+        }
+        
+        // Safely extract command (first word of message)
+        let command = match message.split_whitespace().next() {
+            Some(cmd) => cmd.to_string(),
+            None => {
+                debug!("No command found in message: {}", message);
+                return None;
+            }
+        };
+        
+        let raw_message_copy = message.clone();
 
         let message = if message.starts_with(command.as_str()) {
             message[command.len()..].trim().to_string()
@@ -81,7 +99,7 @@ fn parse_using_regex(regex: &Regex, raw_message: &str) -> Option<ChatMessage> {
             message
         };
 
-        Some(ChatMessage::new(user_name, message, command, raw_message))
+        Some(ChatMessage::new(user_name, message, command, raw_message_copy))
     } else {
         debug!("Failed to parse message: {}", raw_message);
         None

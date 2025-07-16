@@ -8,8 +8,10 @@ use std::{
 
 use log::{info, warn, LevelFilter};
 use source_cmd_parser::{
-    log_parser::SourceCmdBuilder,
-    model::{ChatMessage, ChatResponse},
+    builder::SourceCmdBuilder,
+    error::SourceCmdError,
+    keyboard::Keyboard,
+    model::ChatMessage,
     parsers::CSSLogParser,
 };
 use tokio::sync::RwLock;
@@ -26,7 +28,7 @@ pub struct UserCooldown {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), SourceCmdError> {
     pretty_env_logger::formatted_timed_builder()
         .filter_level(LevelFilter::Debug)
         .init();
@@ -50,14 +52,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 const COOLDOWN_DURATION: Duration = Duration::from_secs(120); // 2 minutes
 const MESSAGE_LIMIT: usize = 5;
 
+type StateType = Arc<RwLock<State>>;
+type KeyboardType = Keyboard<StateType, SourceCmdError>;
+
 async fn eval(
     chat_message: ChatMessage,
-    state_lock: Arc<RwLock<State>>,
-) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
+    state_lock: StateType,
+    mut keyboard: KeyboardType,
+) -> Result<(), SourceCmdError> {
     let message = chat_message.raw_message;
 
     if message.trim().parse::<f64>().is_ok() {
-        return Ok(None);
+        return Ok(());
     }
 
     match meval::eval_str(&message.replace('x', "*")) {
@@ -84,7 +90,7 @@ async fn eval(
                         chat_message.user_name, MESSAGE_LIMIT,
                         COOLDOWN_DURATION - user_cooldown.timestamps[0].elapsed());
 
-                    return Ok(None);
+                    return Ok(());
                 }
 
                 // If not in cooldown, add the new timestamp
@@ -92,8 +98,9 @@ async fn eval(
             }
 
             info!("Eval: {} = {}", message, response);
-            Ok(Some(ChatResponse::new(response.to_string())))
+            keyboard.simulate(response.to_string()).await?;
+            Ok(())
         }
-        Err(_) => Ok(None),
+        Err(_) => Ok(()),
     }
 }

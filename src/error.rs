@@ -22,9 +22,6 @@ pub enum SourceCmdError {
     #[error(transparent)]
     CommandTimeOut(#[from] tokio::time::error::Elapsed),
 
-    #[error(transparent)]
-    RayonThreadpoolError(#[from] rayon::ThreadPoolBuildError),
-
     #[cfg(target_os = "windows")]
     #[error("Unable to set clipboard: {0}")]
     ClipboardError(String),

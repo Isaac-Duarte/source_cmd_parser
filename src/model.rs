@@ -76,6 +76,4 @@ pub struct Config<T> {
 
     /// This is the key that will be used to send chat messages
     pub(crate) chat_key: enigo::Key,
-
-    pub(crate) threads: usize,
 }

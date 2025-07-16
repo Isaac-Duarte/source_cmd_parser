@@ -5,8 +5,10 @@ use chrono::{DateTime, Utc};
 use lazy_static::lazy_static;
 use log::{info, LevelFilter};
 use source_cmd_parser::{
-    log_parser::SourceCmdBuilder,
-    model::{ChatMessage, ChatResponse},
+    builder::SourceCmdBuilder,
+    error::SourceCmdError,
+    keyboard::Keyboard,
+    model::ChatMessage,
     parsers::CSSLogParser,
 };
 use tokio::sync::RwLock;
@@ -26,7 +28,7 @@ pub struct State {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), SourceCmdError> {
     pretty_env_logger::formatted_timed_builder()
         .filter_level(LevelFilter::Debug)
         .init();
@@ -48,10 +50,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+type StateType = Arc<RwLock<State>>;
+type ErrorType = SourceCmdError;
+type KeyboardType = Keyboard<StateType, ErrorType>;
+
 async fn explain(
     chat_message: ChatMessage,
-    state: Arc<RwLock<State>>,
-) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
+    state: StateType,
+    mut keyboard: KeyboardType,
+) -> Result<(), ErrorType> {
     info!("Explain: {}", chat_message.message);
 
     {
@@ -61,7 +68,7 @@ async fn explain(
             // Greater than 10 seconds
             if last_message_time + chrono::Duration::seconds(30) > Utc::now() {
                 info!("Skipping explain. Last message was less than 30 seconds ago.");
-                return Ok(None);
+                return Ok(());
             }
         }
         state.last_message_time = Some(chat_message.time_stamp);
@@ -73,7 +80,8 @@ async fn explain(
             state.read().await.personality,
             chat_message.message
         ))
-        .await.unwrap();
+        .await
+        .map_err(|e| SourceCmdError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
 
     let mut chat_response = "[AI]: ".to_string();
 
@@ -82,18 +90,21 @@ async fn explain(
     // Limit chat repsonse to 120 charactes
     // chat_response = chat_response.chars().take(120).collect();
 
-    Ok(Some(ChatResponse::new(chat_response)))
+    keyboard.simulate(chat_response).await?;
+    Ok(())
 }
 
 async fn dad_joke(
     _: ChatMessage,
-    _: Arc<RwLock<State>>,
-) -> Result<Option<ChatResponse>, Box<dyn std::error::Error>> {
+    _: StateType,
+    mut keyboard: KeyboardType,
+) -> Result<(), ErrorType> {
     let response: CompletionResponse = GPT_CLIENT
         .send_message("Please tell me a data joke".to_string())
         .await
-        .unwrap();
+        .map_err(|e| SourceCmdError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
 
     let chat_response = response.message_choices[0].message.content.clone();
-    Ok(Some(ChatResponse::new(chat_response)))
+    keyboard.simulate(chat_response).await?;
+    Ok(())
 }

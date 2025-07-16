@@ -1,32 +1,28 @@
 use std::{
     collections::HashMap,
-    fs::File,
     future::Future,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
-    marker::PhantomData,
-    path::{Path, PathBuf},
+    io::{BufRead, Read, Seek},
     pin::Pin,
-    sync::{atomic::AtomicBool, Arc},
-    task::Poll,
-    time::Duration,
+    sync::Arc,
 };
 
 use clipboard_rs::ClipboardContext;
-use enigo::{Key, KeyboardControllable};
+use enigo::KeyboardControllable;
 use futures::{
     channel::mpsc::{channel, Receiver},
     SinkExt, Stream, StreamExt,
 };
 use log::{debug, error, info};
-use notify::{EventKind, RecommendedWatcher, Watcher};
-use rayon::ThreadPoolBuilder;
+use notify::{RecommendedWatcher, Watcher};
 use tokio::{
     sync::{Mutex, MutexGuard},
     time,
 };
 
 use crate::{
-    error::{SourceCmdError, SourceCmdResult},
+    builder::SourceCmdBuilder,
+    error::SourceCmdResult,
+    keyboard::Keyboard,
     model::{ChatMessage, ChatResponse, Config},
 };
 
@@ -123,42 +119,32 @@ pub struct SourceCmdLogParser<T, E> {
     timer: time::Interval,
 }
 
-pub struct Keyboard<State, E: std::error::Error + Send + Sync + 'static> {
-    chat_message: ChatMessage,
-    enigo: Arc<Mutex<enigo::Enigo>>,
-    config: Config<State>,
-    _er: PhantomData<E>,
-    clipboard_ctx: Arc<ClipboardContext>,
-}
-
-impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
-    pub async fn simulate(&mut self, message: String) -> SourceCmdResult<()> {
-        let mut response = ChatResponse::new(message.to_string());
-
-        if self
-            .config
-            .owner
-            .as_ref()
-            .is_some_and(|owner| self.chat_message.user_name.contains(owner))
-        {
-            response.delay_on_enter = Some(self.config.chat_delay);
-        }
-
-        SourceCmdLogParser::<_, E>::run_sequence(
-            &self.config,
-            self.enigo.clone(),
-            response,
-            self.clipboard_ctx.clone(),
-        )
-        .await?;
-
-        tokio::time::sleep(self.config.chat_delay).await;
-
-        Ok(())
-    }
-}
-
 impl<T, E> SourceCmdLogParser<T, E> {
+    /// Creates a new SourceCmdLogParser with the given parameters
+    pub fn new(
+        commands: HashMap<String, Vec<Arc<dyn SourceCmdFn<T, E>>>>,
+        #[cfg(target_os = "linux")] watcher: RecommendedWatcher,
+        #[cfg(target_os = "linux")] rx: Receiver<notify::Result<notify::Event>>,
+        enigo: Arc<Mutex<enigo::Enigo>>,
+        config: Config<T>,
+        parse_log: Box<dyn ParseLog>,
+        #[cfg(target_os = "windows")] timer: time::Interval,
+    ) -> Self {
+        Self {
+            commands,
+            #[cfg(target_os = "linux")]
+            watcher,
+            #[cfg(target_os = "linux")]
+            rx,
+            enigo,
+            last_position: 0,
+            parse_log,
+            config,
+            #[cfg(target_os = "windows")]
+            timer,
+        }
+    }
+
     pub fn builder() -> SourceCmdBuilder<T, E>
     where
         T: Clone + Send + Sync + 'static,
@@ -185,7 +171,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
     ///
     /// # Returns
     /// A result containing a tuple with the initialized file watcher and receiver.
-    fn async_watcher(
+    pub fn async_watcher(
     ) -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<notify::Event>>)> {
         // Increased channel capacity
         let (mut tx, rx) = channel(10);
@@ -243,7 +229,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         };
 
         match response {
-            Ok(response) => Ok(()),
+            Ok(_response) => Ok(()),
             Err(err) => {
                 error!(
                     "Error whil executing command {}: {:?}",
@@ -265,14 +251,13 @@ impl<T, E> SourceCmdLogParser<T, E> {
     ///
     /// # Returns
     /// A result indicating the success or failure of the operation.
-    #[cfg(target_os = "linux")]
-    async fn run_sequence(
+    pub async fn run_sequence(
         config: &Config<T>,
         enigo: Arc<Mutex<enigo::Enigo>>,
         chat_response: ChatResponse,
         ctx: Arc<ClipboardContext>,
     ) -> SourceCmdResult<()> {
-        use clipboard_rs::{Clipboard, ClipboardContext, ContentFormat};
+        use clipboard_rs::{Clipboard, ClipboardContext};
 
         // Function to send a chat message
         async fn send_message<'a>(
@@ -281,9 +266,19 @@ impl<T, E> SourceCmdLogParser<T, E> {
             chat_response: &ChatResponse,
             chat_key: enigo::Key,
             ctx: &ClipboardContext,
-        ) {
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Copy message to clipboard
-            ctx.set_text(message.to_string()).unwrap();
+            #[cfg(target_os = "windows")]
+            {
+                ctx.set_text(message.to_string())
+                    .map_err(|e| crate::error::SourceCmdError::ClipboardError(e.to_string()))?;
+            }
+            
+            #[cfg(not(target_os = "windows"))]
+            {
+                ctx.set_text(message.to_string())
+                    .map_err(|_| crate::error::SourceCmdError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "Clipboard error")))?;
+            }
 
             // Simulate pressing chat key (e.g., open chat window)
             enigo.key_down(chat_key);
@@ -306,6 +301,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
             enigo.key_down(enigo::Key::Return);
             time::sleep(time::Duration::from_millis(20)).await;
             enigo.key_up(enigo::Key::Return);
+            
+            Ok(())
         }
 
         let mut enigo = enigo.lock().await;
@@ -313,29 +310,30 @@ impl<T, E> SourceCmdLogParser<T, E> {
         let message = chat_response.message.as_str();
 
         if message.len() <= config.max_entry_length {
-            send_message(&mut enigo, message, &chat_response, config.chat_key, &ctx).await;
-
+            if let Err(e) = send_message(&mut enigo, message, &chat_response, config.chat_key, &ctx).await {
+                error!("Failed to send message: {}", e);
+            }
             return Ok(());
         }
 
         let words = message.split_whitespace();
-
         let mut current_chunk = String::new();
 
         for word in words {
             if current_chunk.len() + word.len() + 1 > config.max_entry_length {
                 // +1 for space
-                send_message(
+                if let Err(e) = send_message(
                     &mut enigo,
                     &current_chunk,
                     &chat_response,
                     config.chat_key,
                     &ctx,
                 )
-                .await;
+                .await {
+                    error!("Failed to send message chunk: {}", e);
+                }
 
                 time::sleep(config.chat_delay).await;
-
                 current_chunk.clear();
             }
 
@@ -347,38 +345,21 @@ impl<T, E> SourceCmdLogParser<T, E> {
 
         // Send any remaining chunk
         if !current_chunk.is_empty() {
-            send_message(
+            if let Err(e) = send_message(
                 &mut enigo,
                 &current_chunk,
                 &chat_response,
                 config.chat_key,
                 &ctx,
             )
-            .await;
+            .await {
+                error!("Failed to send final message chunk: {}", e);
+            }
 
             time::sleep(config.chat_delay).await;
         }
 
         Ok(())
-    }
-
-    fn handle_execution_response(
-        config: &Config<T>,
-        response: Option<ChatResponse>,
-        message: &ChatMessage,
-    ) -> Option<ChatResponse> {
-        response.map(|mut response| {
-            // If the response has an owner, add a delay before executing
-            if config
-                .owner
-                .as_ref()
-                .is_some_and(|owner| message.user_name.contains(owner))
-            {
-                response.delay_on_enter = Some(config.chat_delay);
-            }
-
-            response
-        })
     }
 
     /// Starts monitoring the file for changes, parses chat messages,
@@ -395,7 +376,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         info!("Watching: {:?}", parent);
 
         // Initial read
-        SourceCmdLogParser::<T, E>::read_new_lines(
+        Self::read_new_lines(
             &self.config.file_path,
             &mut self.last_position,
         )?;
@@ -405,50 +386,39 @@ impl<T, E> SourceCmdLogParser<T, E> {
         self.watcher
             .watch(parent, notify::RecursiveMode::NonRecursive)?;
 
-        info!("Creating thread pool with {} threads", self.config.threads);
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(self.config.threads)
-            .build()?;
+        info!("Using tokio tasks for command execution");
 
         let ctx = Arc::new(ClipboardContext::new().unwrap());
 
         while let Some(messages) = self.next().await {
             for message in messages? {
-                // This will execute the desingated command, and commands with no prefix
+                // This will execute the designated command, and commands with no prefix
                 for cmd_arg in [&message.command, ""].iter() {
                     if let Some(commands) = self.get_commands(cmd_arg) {
                         for command in commands {
-                            // Clone items to be moved into the thread
+                            // Clone items to be moved into the task
                             let cloned_config = self.config.clone();
                             let cloned_message = message.clone();
                             let cloned_enigo: Arc<Mutex<enigo::Enigo>> = self.enigo.clone();
                             let cloned_command = command.clone();
                             let cloned_clipboard_context = ctx.clone();
 
-                            pool.spawn(move || {
-                                let runtime = tokio::runtime::Runtime::new().unwrap();
+                            // Spawn async task instead of blocking thread
+                            tokio::spawn(async move {
+                                let keyboard = Keyboard::new(
+                                    cloned_message.clone(),
+                                    cloned_enigo,
+                                    cloned_config.clone(),
+                                    cloned_clipboard_context,
+                                );
 
-                                let response: SourceCmdResult = runtime.block_on(async {
-                                    let keyboard = Keyboard {
-                                        enigo: cloned_enigo,
-                                        config: cloned_config.clone(),
-                                        chat_message: cloned_message.clone(),
-                                        _er: PhantomData,
-                                        clipboard_ctx: cloned_clipboard_context,
-                                    };
-
-                                    Self::execute_command(
-                                        &cloned_config,
-                                        cloned_command.as_ref(),
-                                        &cloned_message,
-                                        keyboard,
-                                    )
-                                    .await?;
-
-                                    Ok(())
-                                });
-
-                                if let Err(err) = response {
+                                if let Err(err) = Self::execute_command(
+                                    &cloned_config,
+                                    cloned_command.as_ref(),
+                                    &cloned_message,
+                                    keyboard,
+                                )
+                                .await {
                                     error!("Error while executing command: {:?}", err);
                                 }
                             });
@@ -463,13 +433,21 @@ impl<T, E> SourceCmdLogParser<T, E> {
         Ok(())
     }
 
-    fn read_new_lines(filename: &Path, last_position: &mut u64) -> SourceCmdResult<Vec<String>> {
+    /// Reads new lines from the monitored file since the last read position.
+    ///
+    /// # Arguments
+    /// * `filename` - Path to the file to read
+    /// * `last_position` - Mutable reference to the last read position
+    ///
+    /// # Returns
+    /// Vector of new lines found in the file
+    pub fn read_new_lines(filename: &std::path::Path, last_position: &mut u64) -> SourceCmdResult<Vec<String>> {
         debug!("Reading new lines from: {:?}", filename);
         let mut lines = Vec::new();
-        let file = File::open(filename)?;
-        let mut reader = BufReader::new(file);
+        let file = std::fs::File::open(filename)?;
+        let mut reader = std::io::BufReader::new(file);
 
-        reader.seek(SeekFrom::Start(*last_position))?;
+        reader.seek(std::io::SeekFrom::Start(*last_position))?;
 
         for line in reader.by_ref().lines().flatten() {
             lines.push(line);
@@ -480,20 +458,10 @@ impl<T, E> SourceCmdLogParser<T, E> {
     }
 }
 
-/// Attempts to poll for the next set of chat messages from the watched file.
+/// Stream implementation for SourceCmdLogParser.
 ///
-/// This method polls the underlying file watcher for any changes and attempts to read and
-/// parse chat messages when a file modification event occurs for the monitored file.
-///
-/// # Parameters
-/// - `self`: A pinned mutable reference to the current instance of `SourceCmdLogParser`.
-/// - `cx`: A mutable reference to the current task context.
-///
-/// # Returns
-/// - `Poll::Ready(Some(Ok(messages)))`: When valid chat messages are parsed from a file modification.
-/// - `Poll::Ready(Some(Err(_)))`: When there's an error while reading or parsing the file.
-/// - `Poll::Ready(None)`: When the stream ends, i.e., no more messages are expected.
-/// - `Poll::Pending`: When there's no new data available yet, but the stream hasn't ended.
+/// This allows the parser to be used as an async stream that yields
+/// chat messages as they are detected in the monitored file.
 impl<T, E> Stream for SourceCmdLogParser<T, E>
 where
     T: Unpin + Clone + Sync + Send + 'static,
@@ -501,6 +469,7 @@ where
 {
     type Item = SourceCmdResult<Vec<ChatMessage>>;
 
+    /// Windows implementation that polls the file at regular intervals.
     #[cfg(target_os = "windows")]
     fn poll_next(
         self: Pin<&mut Self>,
@@ -511,7 +480,7 @@ where
         // Check if the stop flag is set
         if let Some(stop_flag) = &cmd_parser.config.stop_flag {
             if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return Poll::Ready(None);
+                return std::task::Poll::Ready(None);
             }
         }
 
@@ -519,7 +488,7 @@ where
         if cmd_parser.timer.poll_tick(cx).is_ready() {
             debug!("Polling file for new data");
             // Attempt to read new lines from the file
-            match SourceCmdLogParser::<T, E>::read_new_lines(
+            match Self::read_new_lines(
                 &cmd_parser.config.file_path,
                 &mut cmd_parser.last_position,
             ) {
@@ -530,48 +499,50 @@ where
                         .collect::<Vec<_>>();
 
                     if !messages.is_empty() {
-                        return Poll::Ready(Some(Ok(messages)));
+                        return std::task::Poll::Ready(Some(Ok(messages)));
                     }
                 }
                 Err(e) => {
                     error!("Error reading file: {:?}", e);
-                    // You may choose to return an error or continue polling
-                    return Poll::Ready(Some(Err(e.into())));
+                    return std::task::Poll::Ready(Some(Err(e)));
                 }
             }
         }
 
         // If there are no new messages, return Poll::Pending to be polled again
         cx.waker().wake_by_ref();
-        Poll::Pending
+        std::task::Poll::Pending
     }
 
+    /// Linux implementation that uses file system events for efficient monitoring.
     #[cfg(target_os = "linux")]
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
+        use notify::EventKind;
+
         let cmd_parser = self.get_mut();
 
         // Check if the stop flag is set
         if let Some(stop_flag) = &cmd_parser.config.stop_flag {
             if stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return Poll::Ready(None);
+                return std::task::Poll::Ready(None);
             }
         }
 
         match Pin::new(&mut cmd_parser.rx).poll_next(cx) {
-            Poll::Ready(Some(event_result)) => {
+            std::task::Poll::Ready(Some(event_result)) => {
                 match event_result {
                     Ok(event) => {
                         // Validate event is a file write and is the file we're watching
                         if !EventKind::is_modify(&event.kind)
                             || event.paths[0] != cmd_parser.config.file_path
                         {
-                            return Poll::Ready(Some(Ok(vec![])));
+                            return std::task::Poll::Ready(Some(Ok(vec![])));
                         }
 
-                        let lines = SourceCmdLogParser::<T, E>::read_new_lines(
+                        let lines = Self::read_new_lines(
                             &cmd_parser.config.file_path,
                             &mut cmd_parser.last_position,
                         )?;
@@ -581,178 +552,18 @@ where
                             .filter_map(|line| cmd_parser.parse_log.parse_command(line))
                             .collect::<Vec<_>>();
 
-                        Poll::Ready(Some(Ok(messages)))
+                        std::task::Poll::Ready(Some(Ok(messages)))
                     }
                     Err(e) => {
-                        error!("Error: {:?}", e);
-                        // Handle error
-                        Poll::Pending
+                        error!("File watcher error: {:?}", e);
+                        std::task::Poll::Pending
                     }
                 }
             }
-            Poll::Ready(None) => {
-                Poll::Ready(None) // Stream ended
+            std::task::Poll::Ready(None) => {
+                std::task::Poll::Ready(None) // Stream ended
             }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-pub struct SourceCmdBuilder<T, E> {
-    file_path: Option<PathBuf>,
-    time_out: Option<Duration>,
-    commands: HashMap<String, Vec<Arc<dyn SourceCmdFn<T, E>>>>,
-    owner: Option<String>,
-    state: Option<T>,
-    parse_log: Option<Box<dyn ParseLog>>,
-    max_entry_length: usize,
-    chat_delay: Duration,
-    stop_flag: Option<Arc<AtomicBool>>,
-    chat_key: enigo::Key,
-    threads: usize,
-}
-
-impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static> Default
-    for SourceCmdBuilder<T, E>
-{
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static>
-    SourceCmdBuilder<T, E>
-{
-    pub fn new() -> Self {
-        Self {
-            file_path: None,
-            time_out: None,
-            commands: HashMap::new(),
-            owner: None,
-            state: None,
-            parse_log: None,
-            max_entry_length: 128,
-            chat_delay: Duration::from_millis(600),
-            stop_flag: None,
-            chat_key: enigo::Key::Layout('y'),
-            threads: num_cpus::get(),
-        }
-    }
-
-    pub fn file_path(mut self, file_path: Box<dyn AsRef<Path>>) -> Self {
-        let path_buf = file_path.as_ref().as_ref();
-        self.file_path = Some(path_buf.to_path_buf());
-
-        self
-    }
-
-    pub fn time_out(mut self, time_out: Duration) -> Self {
-        self.time_out = Some(time_out);
-        self
-    }
-
-    pub fn add_command<F: SourceCmdFn<T, E> + 'static>(
-        mut self,
-        command: &str,
-        function: F,
-    ) -> Self {
-        self.commands
-            .entry(command.to_string())
-            .or_default()
-            .push(Arc::new(function));
-
-        self
-    }
-
-    pub fn add_global_command<F: SourceCmdFn<T, E> + 'static>(mut self, function: F) -> Self {
-        self.commands
-            .entry("".to_string())
-            .or_default()
-            .push(Arc::new(function));
-
-        self
-    }
-
-    pub fn owner(mut self, owner: &str) -> Self {
-        self.owner = Some(owner.to_string());
-        self
-    }
-
-    pub fn state(mut self, state: T) -> Self {
-        self.state = Some(state);
-        self
-    }
-
-    pub fn set_parser(mut self, parse_log: Box<dyn ParseLog>) -> Self {
-        self.parse_log = Some(parse_log);
-        self
-    }
-
-    pub fn max_entry_length(mut self, max_entry_length: usize) -> Self {
-        self.max_entry_length = max_entry_length;
-        self
-    }
-
-    pub fn stop_flag(mut self, stop_flag: Arc<AtomicBool>) -> Self {
-        self.stop_flag = Some(stop_flag);
-        self
-    }
-
-    pub fn chat_key(mut self, chat_key: enigo::Key) -> Self {
-        self.chat_key = chat_key;
-        self
-    }
-
-    pub fn chat_delay(mut self, chat_delay: Duration) -> Self {
-        self.chat_delay = chat_delay;
-        self
-    }
-
-    pub fn threads(mut self, threads: usize) -> Self {
-        self.threads = threads;
-        self
-    }
-
-    pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T, E>> {
-        if let (Some(file_path), Some(state), Some(parse_log)) =
-            (self.file_path, self.state, self.parse_log)
-        {
-            #[cfg(target_os = "linux")]
-            let (watcher, rx) = SourceCmdLogParser::<T, E>::async_watcher()?;
-
-            Ok(SourceCmdLogParser {
-                commands: self.commands,
-                #[cfg(target_os = "linux")]
-                watcher,
-                #[cfg(target_os = "linux")]
-                rx,
-                enigo: {
-                    let mut enigo = enigo::Enigo::new();
-
-                    #[cfg(target_os = "linux")]
-                    enigo.set_delay(0);
-                    Arc::new(Mutex::new(enigo))
-                },
-                last_position: 0,
-                config: Config {
-                    file_path,
-                    time_out: self.time_out,
-                    owner: self.owner,
-                    shared_state: state,
-                    max_entry_length: self.max_entry_length,
-                    chat_delay: self.chat_delay,
-                    stop_flag: self.stop_flag,
-                    chat_key: self.chat_key,
-                    threads: self.threads,
-                },
-                parse_log,
-                #[cfg(target_os = "windows")]
-                timer: time::interval(Duration::from_millis(100)),
-            })
-        } else {
-            Err(SourceCmdError::MissingFieldS(
-                "file_path, state, parse_log".to_string(),
-            ))
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
