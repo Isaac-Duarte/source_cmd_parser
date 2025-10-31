@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
@@ -25,26 +26,27 @@ use crate::{
 /// use source_cmd_parser::SourceCmdLogParser;
 /// use std::time::Duration;
 ///
-/// let parser = SourceCmdLogParser::builder()
-///     .file_path(Box::new("game.log"))
-///     .time_out(Duration::from_secs(5))
-///     .add_command("!hello", |msg, state, mut kb| async move {
-///         kb.simulate("Hello there!".to_string()).await?;
-///         Ok(())
-///     })
-///     .build()?;
+ /// let parser = SourceCmdLogParser::builder()
+ ///     .file_path(Box::new("game.log"))
+ ///     .time_out(Duration::from_secs(5))
+ ///     .cfg_file_path("cfg/scp.cfg")
+ ///     .exec_bind_key(enigo::Key::Layout('p'))
+ ///     .add_command("!hello", |msg, state, mut kb| async move {
+ ///         kb.simulate("Hello there!".to_string()).await?;
+ ///         Ok(())
+ ///     })
+ ///     .build()?;
 /// ```
 pub struct SourceCmdBuilder<T, E> {
     file_path: Option<PathBuf>,
+    cfg_file_path: Option<PathBuf>,
     time_out: Option<Duration>,
     commands: HashMap<String, Vec<Arc<dyn SourceCmdFn<T, E>>>>,
     owner: Option<String>,
     state: Option<T>,
     parse_log: Option<Box<dyn ParseLog>>,
-    max_entry_length: usize,
-    chat_delay: Duration,
     stop_flag: Option<Arc<AtomicBool>>,
-    chat_key: enigo::Key,
+    exec_bind_key: enigo::Key,
 }
 
 impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static> Default
@@ -62,15 +64,14 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
     pub fn new() -> Self {
         Self {
             file_path: None,
+            cfg_file_path: None,
             time_out: None,
             commands: HashMap::new(),
             owner: None,
             state: None,
             parse_log: None,
-            max_entry_length: 128,
-            chat_delay: Duration::from_millis(600),
             stop_flag: None,
-            chat_key: enigo::Key::Layout('y'),
+            exec_bind_key: enigo::Key::Layout('p'), // Default to 'p' key
         }
     }
 
@@ -81,6 +82,12 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
     pub fn file_path(mut self, file_path: Box<dyn AsRef<Path>>) -> Self {
         let path_buf = file_path.as_ref().as_ref();
         self.file_path = Some(path_buf.to_path_buf());
+        self
+    }
+
+    /// Sets the cfg file that will receive generated chat commands.
+    pub fn cfg_file_path<P: AsRef<Path>>(mut self, cfg_file_path: P) -> Self {
+        self.cfg_file_path = Some(cfg_file_path.as_ref().to_path_buf());
         self
     }
 
@@ -149,17 +156,6 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         self
     }
 
-    /// Sets the maximum length of a single chat message.
-    ///
-    /// Messages longer than this will be split into multiple chunks.
-    ///
-    /// # Arguments
-    /// * `max_entry_length` - Maximum characters per message chunk
-    pub fn max_entry_length(mut self, max_entry_length: usize) -> Self {
-        self.max_entry_length = max_entry_length;
-        self
-    }
-
     /// Sets the stop flag for graceful shutdown.
     ///
     /// # Arguments
@@ -169,21 +165,12 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         self
     }
 
-    /// Sets the key used to open the chat window.
+    /// Sets the key that will be pressed to execute the cfg file.
     ///
     /// # Arguments
-    /// * `chat_key` - The key that opens the chat input (e.g., 'y' for most Source games)
-    pub fn chat_key(mut self, chat_key: enigo::Key) -> Self {
-        self.chat_key = chat_key;
-        self
-    }
-
-    /// Sets the delay between message chunks and owner message delays.
-    ///
-    /// # Arguments
-    /// * `chat_delay` - Time to wait between message chunks
-    pub fn chat_delay(mut self, chat_delay: Duration) -> Self {
-        self.chat_delay = chat_delay;
+    /// * `exec_bind_key` - The key bound to `exec scp.cfg` in the game
+    pub fn exec_bind_key(mut self, exec_bind_key: enigo::Key) -> Self {
+        self.exec_bind_key = exec_bind_key;
         self
     }
 
@@ -193,13 +180,24 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
     /// A configured `SourceCmdLogParser` ready to run
     ///
     /// # Errors
-    /// Returns an error if required fields (file_path, state, parse_log) are missing
+    /// Returns an error if required fields (file_path, cfg_file_path, state, parse_log) are missing
     pub fn build(self) -> SourceCmdResult<SourceCmdLogParser<T, E>> {
-        if let (Some(file_path), Some(state), Some(parse_log)) =
-            (self.file_path, self.state, self.parse_log)
-        {
+        if let (Some(file_path), Some(cfg_file_path), Some(state), Some(parse_log)) = (
+            self.file_path,
+            self.cfg_file_path,
+            self.state,
+            self.parse_log,
+        ) {
             #[cfg(target_os = "linux")]
             let (watcher, rx) = SourceCmdLogParser::<T, E>::async_watcher()?;
+
+            if let Some(parent) = cfg_file_path.parent() {
+                fs::create_dir_all(parent)?;
+            } else {
+                return Err(SourceCmdError::UnableToGetParentDirectory(
+                    cfg_file_path.clone(),
+                ));
+            }
 
             let enigo = {
                 let mut enigo = enigo::Enigo::new();
@@ -213,10 +211,11 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
                 time_out: self.time_out,
                 owner: self.owner,
                 shared_state: state,
-                max_entry_length: self.max_entry_length,
-                chat_delay: self.chat_delay,
                 stop_flag: self.stop_flag,
-                chat_key: self.chat_key,
+                cfg_file_path: cfg_file_path.clone(),
+                cfg_write_lock: Arc::new(Mutex::new(())),
+                exec_bind_key: self.exec_bind_key,
+                enigo,
             };
 
             Ok(SourceCmdLogParser::new(
@@ -225,7 +224,6 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
                 watcher,
                 #[cfg(target_os = "linux")]
                 rx,
-                enigo,
                 config,
                 parse_log,
                 #[cfg(target_os = "windows")]
@@ -233,7 +231,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
             ))
         } else {
             Err(SourceCmdError::MissingFieldS(
-                "file_path, state, parse_log".to_string(),
+                "file_path, cfg_file_path, state, parse_log".to_string(),
             ))
         }
     }

@@ -6,29 +6,23 @@ use std::{
     sync::Arc,
 };
 
-use clipboard_rs::ClipboardContext;
-use enigo::KeyboardControllable;
 use futures::{
     channel::mpsc::{channel, Receiver},
     SinkExt, Stream, StreamExt,
 };
 use log::{debug, error, info};
 use notify::{RecommendedWatcher, Watcher};
-use tokio::{
-    sync::{Mutex, MutexGuard},
-    time,
-};
+use tokio::time;
 
 use crate::{
     builder::SourceCmdBuilder,
     error::SourceCmdResult,
     keyboard::Keyboard,
-    model::{ChatMessage, ChatResponse, Config},
+    model::{ChatMessage, Config},
 };
 
 /// The `SourceCmdFn` trait provides a unified interface for functions
-/// that accept a chat message and asynchronously produce a result with
-/// an optional chat response.
+/// that accept a chat message and asynchronously produce a result.
 ///
 /// This trait ensures thread safety by requiring the `Send`, `Sync`,
 /// and `'static` lifetimes for its implementors which allows the function
@@ -38,15 +32,14 @@ where
     T: Clone + Send + Sync + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    /// Takes a `ChatMessage` and returns a future resolving to a result
-    /// containing an optional chat response.
+    /// Takes a `ChatMessage` and returns a future resolving to a result.
     ///
     /// # Parameters
     /// - `message`: The chat message to process.
     ///
     /// # Returns
     /// A pinned box containing a future. When this future is resolved, it yields
-    /// a `SourceCmdResult` containing an optional `ChatResponse`.
+    /// a `SourceCmdResult` indicating success or failure.
     fn call(
         &self,
         message: ChatMessage,
@@ -101,9 +94,6 @@ pub struct SourceCmdLogParser<T, E> {
     #[cfg(target_os = "linux")]
     rx: Receiver<notify::Result<notify::Event>>,
 
-    /// This is the enigo instance that will be used to send key presses
-    enigo: Arc<Mutex<enigo::Enigo>>,
-
     /// This is the last position in the file that was read
     last_position: u64,
 
@@ -125,7 +115,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
         commands: HashMap<String, Vec<Arc<dyn SourceCmdFn<T, E>>>>,
         #[cfg(target_os = "linux")] watcher: RecommendedWatcher,
         #[cfg(target_os = "linux")] rx: Receiver<notify::Result<notify::Event>>,
-        enigo: Arc<Mutex<enigo::Enigo>>,
         config: Config<T>,
         parse_log: Box<dyn ParseLog>,
         #[cfg(target_os = "windows")] timer: time::Interval,
@@ -136,7 +125,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
             watcher,
             #[cfg(target_os = "linux")]
             rx,
-            enigo,
             last_position: 0,
             parse_log,
             config,
@@ -196,7 +184,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
     /// - `message`: The chat message associated with the command.
     ///
     /// # Returns
-    /// An asynchronous result containing an optional `ChatResponse`.
+    /// An asynchronous result indicating whether the command completed successfully.
     pub async fn execute_command(
         config: &Config<T>,
         command: &dyn SourceCmdFn<T, E>,
@@ -241,127 +229,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
         }
     }
 
-    /// Runs a sequence of actions based on the provided `ChatResponse`.
-    ///
-    /// This method triggers the sequence of key presses based on the `chat_response` message,
-    /// and, if provided, it waits for a specified delay before pressing the 'Enter' key.
-    ///
-    /// # Parameters
-    /// - `chat_response`: The chat response containing the message sequence.
-    ///
-    /// # Returns
-    /// A result indicating the success or failure of the operation.
-    pub async fn run_sequence(
-        config: &Config<T>,
-        enigo: Arc<Mutex<enigo::Enigo>>,
-        chat_response: ChatResponse,
-        ctx: Arc<ClipboardContext>,
-    ) -> SourceCmdResult<()> {
-        use clipboard_rs::{Clipboard, ClipboardContext};
-
-        // Function to send a chat message
-        async fn send_message<'a>(
-            enigo: &mut MutexGuard<'a, enigo::Enigo>,
-            message: &str,
-            chat_response: &ChatResponse,
-            chat_key: enigo::Key,
-            ctx: &ClipboardContext,
-        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            // Copy message to clipboard
-            #[cfg(target_os = "windows")]
-            {
-                ctx.set_text(message.to_string())
-                    .map_err(|e| crate::error::SourceCmdError::ClipboardError(e.to_string()))?;
-            }
-            
-            #[cfg(not(target_os = "windows"))]
-            {
-                ctx.set_text(message.to_string())
-                    .map_err(|_| crate::error::SourceCmdError::IoError(std::io::Error::new(std::io::ErrorKind::Other, "Clipboard error")))?;
-            }
-
-            // Simulate pressing chat key (e.g., open chat window)
-            enigo.key_down(chat_key);
-            time::sleep(time::Duration::from_millis(20)).await;
-            enigo.key_up(chat_key);
-
-            // Simulate Ctrl+V to paste the message
-            enigo.key_down(enigo::Key::Control);
-            enigo.key_down(enigo::Key::Layout('v'));
-            tokio::time::sleep(time::Duration::from_millis(20)).await;
-            enigo.key_up(enigo::Key::Control);
-            enigo.key_up(enigo::Key::Layout('v'));
-
-            // Wait if there is any delay before pressing Enter
-            if let Some(delay) = chat_response.delay_on_enter {
-                time::sleep(delay).await;
-            }
-
-            // Simulate pressing Enter to send the message
-            enigo.key_down(enigo::Key::Return);
-            time::sleep(time::Duration::from_millis(20)).await;
-            enigo.key_up(enigo::Key::Return);
-            
-            Ok(())
-        }
-
-        let mut enigo = enigo.lock().await;
-
-        let message = chat_response.message.as_str();
-
-        if message.len() <= config.max_entry_length {
-            if let Err(e) = send_message(&mut enigo, message, &chat_response, config.chat_key, &ctx).await {
-                error!("Failed to send message: {}", e);
-            }
-            return Ok(());
-        }
-
-        let words = message.split_whitespace();
-        let mut current_chunk = String::new();
-
-        for word in words {
-            if current_chunk.len() + word.len() + 1 > config.max_entry_length {
-                // +1 for space
-                if let Err(e) = send_message(
-                    &mut enigo,
-                    &current_chunk,
-                    &chat_response,
-                    config.chat_key,
-                    &ctx,
-                )
-                .await {
-                    error!("Failed to send message chunk: {}", e);
-                }
-
-                time::sleep(config.chat_delay).await;
-                current_chunk.clear();
-            }
-
-            if !current_chunk.is_empty() {
-                current_chunk.push(' ');
-            }
-            current_chunk.push_str(word);
-        }
-
-        // Send any remaining chunk
-        if !current_chunk.is_empty() {
-            if let Err(e) = send_message(
-                &mut enigo,
-                &current_chunk,
-                &chat_response,
-                config.chat_key,
-                &ctx,
-            )
-            .await {
-                error!("Failed to send final message chunk: {}", e);
-            }
-
-            time::sleep(config.chat_delay).await;
-        }
-
-        Ok(())
-    }
-
     /// Starts monitoring the file for changes, parses chat messages,
     /// and executes the associated commands.
     ///
@@ -376,10 +243,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         info!("Watching: {:?}", parent);
 
         // Initial read
-        Self::read_new_lines(
-            &self.config.file_path,
-            &mut self.last_position,
-        )?;
+        Self::read_new_lines(&self.config.file_path, &mut self.last_position)?;
 
         // On windows we are going to do manual polling
         #[cfg(target_os = "linux")]
@@ -387,8 +251,6 @@ impl<T, E> SourceCmdLogParser<T, E> {
             .watch(parent, notify::RecursiveMode::NonRecursive)?;
 
         info!("Using tokio tasks for command execution");
-
-        let ctx = Arc::new(ClipboardContext::new().unwrap());
 
         while let Some(messages) = self.next().await {
             for message in messages? {
@@ -399,18 +261,12 @@ impl<T, E> SourceCmdLogParser<T, E> {
                             // Clone items to be moved into the task
                             let cloned_config = self.config.clone();
                             let cloned_message = message.clone();
-                            let cloned_enigo: Arc<Mutex<enigo::Enigo>> = self.enigo.clone();
                             let cloned_command = command.clone();
-                            let cloned_clipboard_context = ctx.clone();
 
                             // Spawn async task instead of blocking thread
                             tokio::spawn(async move {
-                                let keyboard = Keyboard::new(
-                                    cloned_message.clone(),
-                                    cloned_enigo,
-                                    cloned_config.clone(),
-                                    cloned_clipboard_context,
-                                );
+                                let keyboard =
+                                    Keyboard::new(cloned_message.clone(), cloned_config.clone());
 
                                 if let Err(err) = Self::execute_command(
                                     &cloned_config,
@@ -418,7 +274,8 @@ impl<T, E> SourceCmdLogParser<T, E> {
                                     &cloned_message,
                                     keyboard,
                                 )
-                                .await {
+                                .await
+                                {
                                     error!("Error while executing command: {:?}", err);
                                 }
                             });
@@ -441,7 +298,10 @@ impl<T, E> SourceCmdLogParser<T, E> {
     ///
     /// # Returns
     /// Vector of new lines found in the file
-    pub fn read_new_lines(filename: &std::path::Path, last_position: &mut u64) -> SourceCmdResult<Vec<String>> {
+    pub fn read_new_lines(
+        filename: &std::path::Path,
+        last_position: &mut u64,
+    ) -> SourceCmdResult<Vec<String>> {
         debug!("Reading new lines from: {:?}", filename);
         let mut lines = Vec::new();
         let file = std::fs::File::open(filename)?;
@@ -488,10 +348,8 @@ where
         if cmd_parser.timer.poll_tick(cx).is_ready() {
             debug!("Polling file for new data");
             // Attempt to read new lines from the file
-            match Self::read_new_lines(
-                &cmd_parser.config.file_path,
-                &mut cmd_parser.last_position,
-            ) {
+            match Self::read_new_lines(&cmd_parser.config.file_path, &mut cmd_parser.last_position)
+            {
                 Ok(lines) => {
                     let messages = lines
                         .iter()

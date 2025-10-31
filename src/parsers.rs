@@ -72,16 +72,16 @@ fn parse_using_regex(regex: &Regex, raw_message: &str) -> Option<ChatMessage> {
     if let Some(captures) = regex.captures(&raw_message) {
         // Safely extract user name (capture group 3)
         let user_name = captures.get(3)?.as_str().to_string();
-        
+
         // Safely extract message (capture group 4)
         let message = captures.get(4)?.as_str().to_string();
-        
+
         // Handle empty messages
         if message.trim().is_empty() {
             debug!("Empty message from user: {}", user_name);
             return None;
         }
-        
+
         // Safely extract command (first word of message)
         let command = match message.split_whitespace().next() {
             Some(cmd) => cmd.to_string(),
@@ -90,7 +90,7 @@ fn parse_using_regex(regex: &Regex, raw_message: &str) -> Option<ChatMessage> {
                 return None;
             }
         };
-        
+
         let raw_message_copy = message.clone();
 
         let message = if message.starts_with(command.as_str()) {
@@ -99,7 +99,12 @@ fn parse_using_regex(regex: &Regex, raw_message: &str) -> Option<ChatMessage> {
             message
         };
 
-        Some(ChatMessage::new(user_name, message, command, raw_message_copy))
+        Some(ChatMessage::new(
+            user_name,
+            message,
+            command,
+            raw_message_copy,
+        ))
     } else {
         debug!("Failed to parse message: {}", raw_message);
         None

@@ -5,6 +5,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
@@ -28,28 +29,6 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChatResponse {
-    pub message: String,
-    pub delay_on_enter: Option<Duration>,
-}
-
-impl ChatResponse {
-    pub fn new(message: String) -> Self {
-        Self {
-            message,
-            delay_on_enter: None,
-        }
-    }
-
-    pub fn with_delay(message: String, delay_on_enter: Duration) -> Self {
-        Self {
-            message,
-            delay_on_enter: Some(delay_on_enter),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Config<T> {
     /// This is the path to the file that will be monitored
@@ -64,16 +43,18 @@ pub struct Config<T> {
     /// This is the shared state that will be passed to the command functions
     pub(crate) shared_state: T,
 
-    /// This is the max length of a chat message that will be sent in one chunk
-    pub(crate) max_entry_length: usize,
-
-    /// This is the delay between each chunk of a long message, or when
-    /// the message is sent by the owner
-    pub(crate) chat_delay: Duration,
-
     /// This is the stop flag that will be used to stop the parser
     pub(crate) stop_flag: Option<Arc<AtomicBool>>,
 
-    /// This is the key that will be used to send chat messages
-    pub(crate) chat_key: enigo::Key,
+    /// Location where the generated cfg file will be written
+    pub(crate) cfg_file_path: PathBuf,
+
+    /// Lock to ensure only one command writes to the cfg file at a time
+    pub(crate) cfg_write_lock: Arc<Mutex<()>>,
+
+    /// The key that will trigger the exec command after writing the cfg
+    pub(crate) exec_bind_key: enigo::Key,
+
+    /// Shared enigo instance for pressing the bind key
+    pub(crate) enigo: Arc<Mutex<enigo::Enigo>>,
 }

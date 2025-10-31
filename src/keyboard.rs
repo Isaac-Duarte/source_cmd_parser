@@ -1,86 +1,72 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
-use clipboard_rs::ClipboardContext;
-use tokio::sync::Mutex;
+use enigo::KeyboardControllable;
+use tokio::{fs, io::AsyncWriteExt};
 
 use crate::{
     error::SourceCmdResult,
-    log_parser::SourceCmdLogParser,
-    model::{ChatMessage, ChatResponse, Config},
+    model::{ChatMessage, Config},
 };
 
-/// Provides keyboard simulation functionality for sending chat messages.
+/// Writes chat commands to a cfg file and presses a bind key to execute them.
 ///
-/// This struct wraps the enigo library and provides a high-level interface
-/// for simulating keyboard input to send chat messages in games.
+/// This struct writes chat messages as `say {message}` to the configured cfg file,
+/// then automatically presses the configured bind key to trigger `exec scp.cfg`
+/// in the game. Players should have a bind set up like: `bind p "exec scp.cfg"`
 pub struct Keyboard<State, E: std::error::Error + Send + Sync + 'static> {
     chat_message: ChatMessage,
-    enigo: Arc<Mutex<enigo::Enigo>>,
     config: Config<State>,
     _er: PhantomData<E>,
-    clipboard_ctx: Arc<ClipboardContext>,
 }
 
 impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
-    /// Creates a new Keyboard instance.
+    /// Creates a new Keyboard instance bound to the supplied config.
     ///
     /// # Arguments
     /// * `chat_message` - The original chat message that triggered the command
-    /// * `enigo` - Shared enigo instance for keyboard simulation
-    /// * `config` - Parser configuration
-    /// * `clipboard_ctx` - Shared clipboard context
-    pub fn new(
-        chat_message: ChatMessage,
-        enigo: Arc<Mutex<enigo::Enigo>>,
-        config: Config<State>,
-        clipboard_ctx: Arc<ClipboardContext>,
-    ) -> Self {
+    /// * `config` - Parser configuration containing the cfg destination
+    pub fn new(chat_message: ChatMessage, config: Config<State>) -> Self {
         Self {
             chat_message,
-            enigo,
             config,
             _er: PhantomData,
-            clipboard_ctx,
         }
     }
 
-    /// Simulates typing and sending a chat message.
+    /// Writes the message to the configured cfg file as `say {message}`.
     ///
-    /// This method handles:
-    /// - Copying the message to clipboard
-    /// - Opening the chat window
-    /// - Pasting the message
-    /// - Sending the message
-    /// - Applying delays for owner messages
-    /// - Splitting long messages into chunks
-    ///
-    /// # Arguments
-    /// * `message` - The message to send
-    ///
-    /// # Returns
-    /// Result indicating success or failure
+    /// After writing the file, this method will press the configured bind key
+    /// to trigger the `exec scp.cfg` command in the game.
     pub async fn simulate(&mut self, message: String) -> SourceCmdResult<()> {
-        let mut response = ChatResponse::new(message);
+        let mut sanitised = message.replace(['\r', '\n'], " ").trim().to_string();
 
-        // Apply delay for owner messages
-        if self
-            .config
-            .owner
-            .as_ref()
-            .is_some_and(|owner| self.chat_message.user_name.contains(owner))
-        {
-            response.delay_on_enter = Some(self.config.chat_delay);
+        if sanitised.is_empty() {
+            return Ok(());
         }
 
-        SourceCmdLogParser::<_, E>::run_sequence(
-            &self.config,
-            self.enigo.clone(),
-            response,
-            self.clipboard_ctx.clone(),
-        )
-        .await?;
+        // Prevent accidental brace balancing issues by escaping closing braces.
+        sanitised = sanitised.replace('}', "\\}");
 
-        tokio::time::sleep(self.config.chat_delay).await;
+        let payload = format!("say {{{}}}\n", sanitised);
+        let cfg_path = self.config.cfg_file_path.clone();
+        let lock = self.config.cfg_write_lock.clone();
+
+        let _guard = lock.lock().await;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&cfg_path)
+            .await?;
+
+        file.write_all(payload.as_bytes()).await?;
+        file.flush().await?;
+
+        // Press the bind key to execute the cfg
+        let mut enigo = self.config.enigo.lock().await;
+        enigo.key_down(self.config.exec_bind_key);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        enigo.key_up(self.config.exec_bind_key);
 
         Ok(())
     }

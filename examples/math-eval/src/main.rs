@@ -36,8 +36,12 @@ async fn main() -> Result<(), SourceCmdError> {
 
     let mut parser = SourceCmdBuilder::new()
         .file_path(Box::new(PathBuf::from(
-            "/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/log.txt",
+            "/home/isaac/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/log.txt",
         )))
+        .cfg_file_path(PathBuf::from(
+            "/home/isaac/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/cfg/scp.cfg",
+        ))
+        .exec_bind_key(source_cmd_parser::enigo::Key::Layout('p')) // Configure your bind key here
         .state(Arc::new(RwLock::new(State::default())))
         .set_parser(Box::new(CSSLogParser::new()))
         .add_global_command(eval)
