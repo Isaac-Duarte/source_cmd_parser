@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use enigo::KeyboardControllable;
 use tokio::{fs, io::AsyncWriteExt};
@@ -54,12 +54,10 @@ impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
             tokio::time::sleep(self.config.chat_delay).await;
         }
 
-        log::info!("WHAT?");
-
         // Prevent accidental brace balancing issues by escaping closing braces.
         sanitised = sanitised.replace('}', "\\}");
 
-        let payload = format!("say {{{}}}\n", sanitised);
+        let payload = format!("say {}\n", sanitised);
         let cfg_path = self.config.cfg_file_path.clone();
         let lock = self.config.cfg_write_lock.clone();
 
@@ -73,6 +71,9 @@ impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
 
         file.write_all(payload.as_bytes()).await?;
         file.flush().await?;
+
+        // Give CS2 a sec
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Press the bind key to execute the cfg
         let mut enigo = self.config.enigo.lock().await;
