@@ -31,6 +31,7 @@ use crate::{
  ///     .time_out(Duration::from_secs(5))
  ///     .cfg_file_path("cfg/scp.cfg")
  ///     .exec_bind_key(enigo::Key::Layout('p'))
+ ///     .chat_delay(Duration::from_millis(500))
  ///     .add_command("!hello", |msg, state, mut kb| async move {
  ///         kb.simulate("Hello there!".to_string()).await?;
  ///         Ok(())
@@ -47,6 +48,7 @@ pub struct SourceCmdBuilder<T, E> {
     parse_log: Option<Box<dyn ParseLog>>,
     stop_flag: Option<Arc<AtomicBool>>,
     exec_bind_key: enigo::Key,
+    chat_delay: Duration,
 }
 
 impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'static> Default
@@ -72,6 +74,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
             parse_log: None,
             stop_flag: None,
             exec_bind_key: enigo::Key::Layout('p'), // Default to 'p' key
+            chat_delay: Duration::from_millis(500), // Default 500ms delay
         }
     }
 
@@ -174,6 +177,15 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
         self
     }
 
+    /// Sets the delay for owner messages before executing commands.
+    ///
+    /// # Arguments
+    /// * `chat_delay` - Time to wait before executing owner commands
+    pub fn chat_delay(mut self, chat_delay: Duration) -> Self {
+        self.chat_delay = chat_delay;
+        self
+    }
+
     /// Builds the `SourceCmdLogParser` with the configured options.
     ///
     /// # Returns
@@ -216,6 +228,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
                 cfg_write_lock: Arc::new(Mutex::new(())),
                 exec_bind_key: self.exec_bind_key,
                 enigo,
+                chat_delay: self.chat_delay,
             };
 
             Ok(SourceCmdLogParser::new(

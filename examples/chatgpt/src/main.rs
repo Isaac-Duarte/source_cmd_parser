@@ -42,6 +42,7 @@ async fn main() -> Result<(), SourceCmdError> {
             "/mnt/games/SteamLibrary/steamapps/common/Counter-Strike Source/cstrike/cfg/scp.cfg",
         ))
         .exec_bind_key(source_cmd_parser::enigo::Key::Layout('p')) // Configure your bind key here
+        .chat_delay(std::time::Duration::from_millis(1000)) // 1 second delay for owner
         .state(Arc::new(RwLock::new(State::default())))
         .set_parser(Box::new(CSSLogParser::new()))
         .add_command(".explain", explain)

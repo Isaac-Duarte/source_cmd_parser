@@ -57,4 +57,7 @@ pub struct Config<T> {
 
     /// Shared enigo instance for pressing the bind key
     pub(crate) enigo: Arc<Mutex<enigo::Enigo>>,
+
+    /// Delay to apply for owner messages before executing commands
+    pub(crate) chat_delay: Duration,
 }
