@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use enigo::KeyboardControllable;
 use tokio::{fs, io::AsyncWriteExt};
@@ -44,10 +44,22 @@ impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
             return Ok(());
         }
 
+          // Apply delay for owner messages
+        if self
+            .config
+            .owner
+            .as_ref()
+            .is_some_and(|owner| self.chat_message.user_name.contains(owner))
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        log::info!("WHAT?");
+
         // Prevent accidental brace balancing issues by escaping closing braces.
         sanitised = sanitised.replace('}', "\\}");
 
-        let payload = format!("say {{{}}}\n", sanitised);
+        let payload = format!("say {}\n", sanitised);
         let cfg_path = self.config.cfg_file_path.clone();
         let lock = self.config.cfg_write_lock.clone();
 
