@@ -249,7 +249,7 @@ impl<T, E> SourceCmdLogParser<T, E> {
         #[cfg(target_os = "linux")]
         self.watcher
             .watch(parent, notify::RecursiveMode::NonRecursive)?;
-            
+
         while let Some(messages) = self.next().await {
             for message in messages? {
                 // This will execute the designated command, and commands with no prefix

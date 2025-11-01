@@ -44,7 +44,7 @@ impl<State, E: std::error::Error + Send + Sync + 'static> Keyboard<State, E> {
             return Ok(());
         }
 
-          // Apply delay for owner messages
+        // Apply delay for owner messages
         if self
             .config
             .owner

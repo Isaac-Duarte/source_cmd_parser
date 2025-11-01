@@ -26,17 +26,17 @@ use crate::{
 /// use source_cmd_parser::SourceCmdLogParser;
 /// use std::time::Duration;
 ///
- /// let parser = SourceCmdLogParser::builder()
- ///     .file_path(Box::new("game.log"))
- ///     .time_out(Duration::from_secs(5))
- ///     .cfg_file_path("cfg/scp.cfg")
- ///     .exec_bind_key(enigo::Key::Layout('p'))
- ///     .chat_delay(Duration::from_millis(500))
- ///     .add_command("!hello", |msg, state, mut kb| async move {
- ///         kb.simulate("Hello there!".to_string()).await?;
- ///         Ok(())
- ///     })
- ///     .build()?;
+/// let parser = SourceCmdLogParser::builder()
+///     .file_path(Box::new("game.log"))
+///     .time_out(Duration::from_secs(5))
+///     .cfg_file_path("cfg/scp.cfg")
+///     .exec_bind_key(enigo::Key::Layout('p'))
+///     .chat_delay(Duration::from_millis(500))
+///     .add_command("!hello", |msg, state, mut kb| async move {
+///         kb.simulate("Hello there!".to_string()).await?;
+///         Ok(())
+///     })
+///     .build()?;
 /// ```
 pub struct SourceCmdBuilder<T, E> {
     file_path: Option<PathBuf>,
