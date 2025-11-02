@@ -240,7 +240,7 @@ impl<T: Clone + Send + Sync + 'static, E: std::error::Error + Send + Sync + 'sta
                 config,
                 parse_log,
                 #[cfg(target_os = "windows")]
-                time::interval(Duration::from_millis(100)),
+                tokio::time::interval(Duration::from_millis(100)),
             ))
         } else {
             Err(SourceCmdError::MissingFieldS(
